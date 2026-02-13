@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+venv/
+.venv/
+env/
+.env
+
+# Distribution / packaging
+*.egg-info/
+*.egg
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PyTorch model files
+*.pt
+*.pth
+checkpoints/
+
+# Logs
+logs/
+
+# Runtime artifacts
+game_winners.log
