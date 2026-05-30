@@ -4,8 +4,7 @@ class StreakResult(Result):
     """Class representing a streak result in a game."""
     def __init__(self, player_id: int, reward: float, is_continue: bool, is_invalid: bool = False) -> None:
         super().__init__(player_id, reward, is_invalid)
-        if not is_invalid:
-            self.is_continue = is_continue
+        self.is_continue: bool | None = is_continue if not is_invalid else None
 
     def __repr__(self) -> str:
         return str(self)

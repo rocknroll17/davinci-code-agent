@@ -1,5 +1,6 @@
 """Da Vinci Code Gymnasium Environment."""
 
+import logging
 from typing import Any, Optional, SupportsFloat
 import numpy as np
 import gymnasium as gym
@@ -7,10 +8,10 @@ from gymnasium import spaces
 
 from src.constants import (
     Phase, Color, MAX_HAND_SIZE, NUM_VALUES,
-    INITIAL_HAND_SIZE_2P, REWARD_WIN, REWARD_LOSE, REWARD_GUESS_SUCCESS,
+    INITIAL_HAND_SIZE_2P, REWARD_WIN, REWARD_GUESS_SUCCESS,
     REWARD_JOKER_SUCCESS, REWARD_GUESS_FAIL, REWARD_STREAK_BONUS_MULTIPLIER,
     REWARD_STREAK_BREAK, REWARD_INVALID_ACTION, REWARD_STOP_DECISION,
-    REWARD_STOP_WITH_DETERMINED
+    REWARD_STOP_WITH_DETERMINED, REWARD_STOP_WITH_NEAR_DETERMINED, REWARD_GUESS_ORDER_VIOLATION
 )
 from src.deck import Deck
 from src.hand import Hand
@@ -21,6 +22,8 @@ from src.result.draw_result import DrawResult
 from src.result.result import Result
 from src.result.streak_result import StreakResult
 from src.phase import PhaseCycle
+
+logger = logging.getLogger(__name__)
 
 VIEWER = 0
 
@@ -125,9 +128,7 @@ class DaVinciCodeEnv(gym.Env):
             Tuple of (observation, info)
         """
         super().reset(seed=seed)
-        import logging
-        logger = logging.getLogger()
-        logger.info(f"Game Start")
+        logger.info("Game Start")
         # Reset random seed
         if seed is not None:
             self._seed = seed
@@ -169,9 +170,7 @@ class DaVinciCodeEnv(gym.Env):
             cards = self._deck.initial_draw(INITIAL_HAND_SIZE_2P)
             self.players[player]._hand.add_initial_cards(cards)
             self.players[player].update_initial_constraint(INITIAL_HAND_SIZE_2P)
-        import logging
-        logger = logging.getLogger()
-        logger.info(f"Player 0 starts turn.")
+        logger.info("Player 0 starts turn.")
 
     def step(
         self,
@@ -191,6 +190,16 @@ class DaVinciCodeEnv(gym.Env):
         if self._done:
             # Standard Gym returns 7 values (observation, render_observation, reward, terminated, truncated, info, result)
             return self._get_observation(), self._get_render_observation(), 0.0, True, False, self._get_info(), None
+        
+        # Capture opponent's true hidden card values BEFORE processing action
+        # (for auxiliary belief loss supervision during training)
+        opponent = 1 - self._current_player
+        hidden_values = np.full(MAX_HAND_SIZE, -1, dtype=np.int8)
+        for i in range(self.players[opponent]._hand.size):
+            card = self.players[opponent]._hand.get_card(i)
+            if card is not None and not card.is_revealed:
+                hidden_values[i] = card.value
+        self._pre_step_hidden_values = hidden_values
         
         # Initialize reward for current step
         step_reward = 0.0
@@ -226,46 +235,28 @@ class DaVinciCodeEnv(gym.Env):
         # Return standard 7-tuple
         return self._get_observation(), self._get_render_observation(), step_reward, terminated, truncated, info, result
     
-    def _get_observation(self):
+    def _get_observation(self, viewer: Optional[int] = None) -> dict:
         """
-        Get current observation from current player's perspective.
-        
-        Returns:
-            Observation dictionary
+        Build the observation dict from ``viewer``'s perspective.
+
+        Args:
+            viewer: player index to observe from. Defaults to the current player.
         """
+        pov = viewer if viewer is not None else self._current_player
+        opponent = 1 - pov
         phase_onehot = np.zeros(3, dtype=np.int8)
         phase_onehot[self._phase.value] = 1
-        current_observation = self.players[self._current_player]._get_observation(is_mine=True)
-        opponent_observation = self.players[1 - self._current_player]._get_observation(is_mine=False)
-        remaining_deck = np.array(self._deck.get_remaining(), dtype=np.int8)
-        observation = {
+        return {
             "phase": phase_onehot,
-            **current_observation,
-            **opponent_observation,
-            "remaining_deck": remaining_deck
+            **self.players[pov].get_own_observation(),
+            **self.players[opponent].get_opponent_observation(),
+            "remaining_deck": np.array(self._deck.get_remaining(), dtype=np.int8),
         }
-        return observation
-    
-    def _get_render_observation(self):
-        """
-        Get observation for rendering from viewer's perspective.
-        
-        Returns:
-            Observation dictionary
-        """
+
+    def _get_render_observation(self) -> dict:
+        """Observation for rendering — uses self.viewer if set."""
         viewer = self.viewer if self.viewer is not None else self._current_player
-        phase_onehot = np.zeros(3, dtype=np.int8)
-        phase_onehot[self._phase.value] = 1
-        current_observation = self.players[viewer]._get_observation(is_mine=True)
-        opponent_observation = self.players[1 - viewer]._get_observation(is_mine=False)
-        remaining_deck = np.array(self._deck.get_remaining(), dtype=np.int8)
-        observation = {
-            "phase": phase_onehot,
-            **current_observation,
-            **opponent_observation,
-            "remaining_deck": remaining_deck
-        }
-        return observation
+        return self._get_observation(viewer=viewer)
 
 
     
@@ -336,8 +327,6 @@ class DaVinciCodeEnv(gym.Env):
         Returns:
             Reward value
         """
-        import logging
-        logger = logging.getLogger()
         position = int(action[1])
         value = int(action[2])
         
@@ -358,7 +347,7 @@ class DaVinciCodeEnv(gym.Env):
             reward = self._handle_guess_success(position, target_card)
         else:
             # Wrong guess
-            reward = self._handle_guess_failure(position, value)
+            reward = self._handle_guess_failure(position, value, target_card.color)
 
         result = GuessResult(self._current_player, reward, position, value, target_card.value == value, is_invalid=False)
         logger.info(result)
@@ -411,13 +400,14 @@ class DaVinciCodeEnv(gym.Env):
         
         return reward
     
-    def _handle_guess_failure(self, position: int, guessed_value: int) -> float:
+    def _handle_guess_failure(self, position: int, guessed_value: int, card_color) -> float:
         """
         Handle failed guess.
         
         Args:
             position: Position that was guessed
             guessed_value: Value that was incorrectly guessed
+            card_color: Color of the card at position (visible, used for constraint update)
             
         Returns:
             Reward value
@@ -425,12 +415,39 @@ class DaVinciCodeEnv(gym.Env):
         reward = REWARD_GUESS_FAIL
 
         opponent = 1 - self._current_player
-        
+        opponent_hand = self.players[opponent]._hand
+
+        # Extra penalty if guessed value violates ordering constraints
+        # (joker=12 can go anywhere, so no ordering constraint applies)
+        if guessed_value != 12:
+            left_val, left_col = None, None
+            for j in range(position - 1, -1, -1):
+                adj = opponent_hand.get_card(j)
+                if adj is not None and adj.is_revealed and not adj.is_joker:
+                    left_val, left_col = int(adj.value), int(adj.color)
+                    break
+            right_val, right_col = None, None
+            for j in range(position + 1, opponent_hand.size):
+                adj = opponent_hand.get_card(j)
+                if adj is not None and adj.is_revealed and not adj.is_joker:
+                    right_val, right_col = int(adj.value), int(adj.color)
+                    break
+            hidden_color_val = int(card_color)
+            out_of_range = False
+            if left_val is not None:
+                if guessed_value < left_val or (guessed_value == left_val and hidden_color_val <= left_col):
+                    out_of_range = True
+            if not out_of_range and right_val is not None:
+                if guessed_value > right_val or (guessed_value == right_val and hidden_color_val >= right_col):
+                    out_of_range = True
+            if out_of_range:
+                reward += REWARD_GUESS_ORDER_VIOLATION
+
         # Streak break penalty
         if self._streak > 0:
             reward += REWARD_STREAK_BREAK
         self._streak = 0
-        index = self.players[self._current_player].guess_fail(position, guessed_value)
+        index = self.players[self._current_player].guess_fail(position, guessed_value, card_color)
         self.players[opponent]._update_constraint_revealed(index)
         self._phase.guess_wrong()
         
@@ -447,19 +464,24 @@ class DaVinciCodeEnv(gym.Env):
             Reward value
         """
         decision = int(action[3])
-        import logging
-        logger = logging.getLogger()
 
         if decision == 0:  # STOP
             # 확정된 미공개 카드가 있는데 맞추지 않고 stop하면 페널티
-            from src.utils.game_logic import find_determined_cards
+            from src.utils.game_logic import find_determined_cards, count_candidate_cards
             determined = find_determined_cards(
                 self.players[self._current_player]._hand,
                 self.players[1 - self._current_player]._hand
             )
-            penalty = len(determined) * REWARD_STOP_WITH_DETERMINED
+            near_determined = count_candidate_cards(
+                self.players[self._current_player]._hand,
+                self.players[1 - self._current_player]._hand,
+                max_candidates=2
+            ) - len(determined)  # 확정 제외한 near-determined 수
+            near_determined = max(0, near_determined)
+            penalty = (len(determined) * REWARD_STOP_WITH_DETERMINED
+                       + near_determined * REWARD_STOP_WITH_NEAR_DETERMINED)
             if determined:
-                logger.info(f"Player {self._current_player} stopped with {len(determined)} determined card(s): {determined}")
+                logger.info(f"Player {self._current_player} stopped with {len(determined)} determined, {near_determined} near-determined card(s)")
             reward = StreakResult(self._current_player, REWARD_STOP_DECISION + penalty, False, is_invalid=False)
             self._phase.end_streak()
         else:  # CONTINUE
@@ -475,8 +497,6 @@ class DaVinciCodeEnv(gym.Env):
     
     def _end_turn(self) -> None:
         """End current player's turn and switch to opponent."""
-        import logging
-        logger = logging.getLogger()
         # Check if current player lost (all cards revealed)
         if self.players[self._current_player]._hand.all_revealed():
             self._done = True
@@ -514,7 +534,8 @@ class DaVinciCodeEnv(gym.Env):
             "my_hand_size": self.players[self._current_player]._hand.size,
             "opponent_hand_size": self.players[1 - self._current_player]._hand.size,
             "viewer_hand_size": self.players[viewer]._hand.size,
-            "deck_remaining": self._deck.total_count
+            "deck_remaining": self._deck.total_count,
+            "hidden_values": self._pre_step_hidden_values if hasattr(self, '_pre_step_hidden_values') else np.full(MAX_HAND_SIZE, -1, dtype=np.int8)
         }
     
     def _get_render_info(self) -> dict[str, Any]:

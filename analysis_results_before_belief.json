@@ -1,0 +1,122 @@
+{
+  "game_stats": {
+    "wins": {
+      "0": 446,
+      "1": 554
+    },
+    "avg_length": 57.601,
+    "std_length": 8.239283888785481
+  },
+  "scenarios": {
+    "s1_elimination": {
+      "correct": false,
+      "prob_correct": 3.559988304147055e-09,
+      "predicted": 0
+    },
+    "s2_ordering": {
+      "correct": true,
+      "prob_in_range": 0.9924536943435669,
+      "predicted": 12
+    },
+    "s3_cross_elim": {
+      "correct": true,
+      "prob_valid": 0.9999911785125732,
+      "prob_eliminated": 2.2758276827516966e-06
+    },
+    "s4_constraint": {
+      "correct": true,
+      "prob_eliminated": 0.0031289297621697187
+    },
+    "s5_determined": {
+      "correct": false,
+      "prob_correct": 0.1845794916152954
+    },
+    "s6_targeting": {
+      "predicted_pos": 1,
+      "predicted_val": 2
+    }
+  },
+  "attention": {
+    "layer_0": {
+      "my_to_opp": 0.07732986106699513,
+      "my_to_my": 0.03614488486096423,
+      "opp_to_my": 0.0372862536755781,
+      "opp_to_opp": 0.07201834588730208,
+      "phase_to_opp": 0.04140402825849671,
+      "phase_to_my": 0.03193189251338763,
+      "same_color": 0.07524400240311123,
+      "same_color_vs_diff_color": 0.9272297976818334,
+      "diff_color": 0.08114924972345443,
+      "to_hidden": 0.07814337759601173,
+      "to_hidden_vs_to_revealed": 0.837562391532726,
+      "to_revealed": 0.09329857499094553,
+      "opp_to_opp_adj": 0.06896981925132172,
+      "opp_to_opp_adj_vs_opp_to_opp_nonadj": 0.9732328626955998,
+      "opp_to_opp_nonadj": 0.07086671843395567
+    },
+    "layer_1": {
+      "my_to_opp": 0.06194627543739093,
+      "my_to_my": 0.046508141109299274,
+      "opp_to_my": 0.04468288213311024,
+      "opp_to_opp": 0.06089033155259426,
+      "phase_to_opp": 0.054940986516975585,
+      "phase_to_my": 0.044125534693920804,
+      "same_color": 0.059336897322305786,
+      "same_color_vs_diff_color": 0.9120292554892672,
+      "diff_color": 0.06506030038529183,
+      "to_hidden": 0.04338104632797261,
+      "to_hidden_vs_to_revealed": 0.5352866407897738,
+      "to_revealed": 0.08104264710205965,
+      "opp_to_opp_adj": 0.06499001523598343,
+      "opp_to_opp_adj_vs_opp_to_opp_nonadj": 1.0427858725678811,
+      "opp_to_opp_nonadj": 0.062323451962332604
+    },
+    "layer_2": {
+      "my_to_opp": 0.03572656903421301,
+      "my_to_my": 0.025111392204266076,
+      "opp_to_my": 0.02457087266736824,
+      "opp_to_opp": 0.04007527803690473,
+      "phase_to_opp": 0.02928651792265111,
+      "phase_to_my": 0.026227602614903638,
+      "same_color": 0.02741993854023561,
+      "same_color_vs_diff_color": 0.5375916670512487,
+      "diff_color": 0.05100514055702739,
+      "to_hidden": 0.06131979099809197,
+      "to_hidden_vs_to_revealed": 2.8776238661400764,
+      "to_revealed": 0.021309175156495958,
+      "opp_to_opp_adj": 0.0410896807465754,
+      "opp_to_opp_adj_vs_opp_to_opp_nonadj": 0.9974738868418453,
+      "opp_to_opp_nonadj": 0.041193740797236915
+    },
+    "layer_3": {
+      "my_to_opp": 0.06046478600281676,
+      "my_to_my": 0.04382908505179309,
+      "opp_to_my": 0.04985852828485045,
+      "opp_to_opp": 0.05795162876041791,
+      "phase_to_opp": 0.06332031466790701,
+      "phase_to_my": 0.0455441882522857,
+      "same_color": 0.06158889527370556,
+      "same_color_vs_diff_color": 1.0470153348785451,
+      "diff_color": 0.05882329820971527,
+      "to_hidden": 0.10296978810506308,
+      "to_hidden_vs_to_revealed": 1.9863625029084562,
+      "to_revealed": 0.0518383668410441,
+      "opp_to_opp_adj": 0.07111587098372522,
+      "opp_to_opp_adj_vs_opp_to_opp_nonadj": 1.2168556262465835,
+      "opp_to_opp_nonadj": 0.058442324175369605
+    }
+  },
+  "attention_flow": {
+    "computed": true
+  },
+  "probing": {
+    "probe_accuracy": 0.26915548098434006,
+    "top3_accuracy": 0.6385626398210291,
+    "random_baseline": 0.07692307692307693,
+    "majority_baseline": 0.09885346756152125,
+    "constraint_baseline": 0.0781071937321937,
+    "n_train": 28608,
+    "n_test": 7152,
+    "verdict": "MODEL ENCODES BELIEF STATE BEYOND CONSTRAINT MATRIX"
+  }
+}

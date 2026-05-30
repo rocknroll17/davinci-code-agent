@@ -1,7 +1,5 @@
 import random
-import sys
 from typing import List, Optional, Tuple
-from typing_extensions import override
 
 import numpy as np
 from src.cards.card import Card, OpponentCard
@@ -19,7 +17,6 @@ class Hand(list[Card]):
         super().__init__()
         self.last_drawn_card: Card | None = None
 
-    @override
     def add_card(self, card: "Card", joker_position: Optional[int] = None) -> int:
         """
         Add a card to the hand following game rules.
@@ -42,11 +39,10 @@ class Hand(list[Card]):
         self.insert(insert_pos, card)
         return insert_pos
     
-    @override
     def add_pending_card(self, card: "Card", position: int) -> int:
         """
-        Add a card to the hand at a specific position.
-        Used for initial card setup where position is predetermined.
+        Insert a card at an exact position without applying game-rule placement logic.
+        Used by the server when the player confirms a joker position.
         Returns the index where the card was inserted.
         """
         self.last_drawn_card = card
@@ -98,19 +94,6 @@ class Hand(list[Card]):
             self.add_card(joker)
 
         self.last_drawn_card = None
-
-    def _find_sorted_position_exclude_joker(self, card: Card) -> int:
-        """
-        조커를 제외하고 정렬된 위치를 찾는다.
-        """
-        pos = 0
-        for i, c in enumerate(self):
-            if c.is_joker:
-                continue
-            if card.sort_key() < c.sort_key():
-                return i
-            pos = i + 1
-        return pos
 
     def _find_valid_positions(self, new_card: Card) -> list[int]:
         """
@@ -169,18 +152,6 @@ class Hand(list[Card]):
         
         return True
 
-    def _can_be_left_of(self, left: Card, right: Card) -> bool:
-        """left가 right의 왼쪽에 올 수 있는지 (조커 미포함 일반 비교)"""
-        # 조커가 포함되면 별도 로직 (실제로는 _is_valid_position에서 처리)
-        if left.is_joker or right.is_joker:
-            return True
-        # 숫자 비교
-        if left.value < right.value:
-            return True
-        if left.value == right.value and left.color < right.color:
-            return True
-        return False
-    
     def to_observation(self, hidden: bool = False) -> np.ndarray:
         """
         Convert hand to observation format.
@@ -306,7 +277,7 @@ class Hand(list[Card]):
         """
         hidden_indices = [i for i, c in enumerate(self) if not getattr(c, "is_revealed", False)]
         if not hidden_indices:
-            sys.exit("Error: No hidden cards to reveal.")
+            raise RuntimeError("reveal_random_hidden: no hidden cards in hand")
         idx = random.choice(hidden_indices)
         self[idx].is_revealed = True
         return idx

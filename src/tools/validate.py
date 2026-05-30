@@ -1,15 +1,7 @@
 # validate_hand.py
-from enum import Enum
-
-from src.constants import CardValue
+from src.constants import CardValue, Color
 
 FILE_PATH = ["logs/card_log_0.txt", "logs/card_log_1.txt"]
-
-# Color/Value Enum 정의
-class Color(Enum):
-    BLACK = "Black"
-    WHITE = "White"
-    NONE = "None"  # 조커(-) 처리
 
 def parse_card(s: str):
     color, value_str = s.strip().split()

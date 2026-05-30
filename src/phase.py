@@ -1,5 +1,11 @@
 from src.constants import Phase
 
+
+class InvalidPhaseTransitionError(RuntimeError):
+    """Raised when a phase transition is called in the wrong state."""
+    pass
+
+
 class PhaseCycle:
     """
     Controls the lifecycle of a Da Vinci Code game phase.
@@ -8,8 +14,8 @@ class PhaseCycle:
     ensuring only valid actions can be performed in each phase.
     """
 
-    def __init__(self) -> None:
-        self._phase: Phase = Phase.DRAW
+    def __init__(self, start: Phase = Phase.DRAW) -> None:
+        self._phase: Phase = start
 
     @property
     def phase(self) -> Phase:
@@ -53,13 +59,8 @@ class PhaseCycle:
 
     def _require(self, expected: Phase) -> None:
         if self._phase is not expected:
-            import logging
-            import sys
-            logger = logging.getLogger()
-            logger.error(f"Invalid transition: {self._phase.name} → {expected.name}")
-            sys.exit(1)
-            raise RuntimeError(
-                f"Invalid transition: {self._phase.name} → {expected.name}"
+            raise InvalidPhaseTransitionError(
+                f"Invalid transition: expected {expected.name}, current {self._phase.name}"
             )
 
     def __eq__(self, other: object) -> bool:
