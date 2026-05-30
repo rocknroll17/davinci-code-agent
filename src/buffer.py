@@ -9,6 +9,8 @@ import numpy as np
 from typing import Dict, List, Generator, Optional
 from dataclasses import dataclass, field
 
+from src.constants import ACTION_KEYS
+
 
 @dataclass
 class Transition:
@@ -22,6 +24,7 @@ class Transition:
     value: float
     action_mask: Optional[Dict[str, np.ndarray]] = None
     env_id: int = 0  # Which parallel env this transition came from
+    hidden_values: Optional[np.ndarray] = None  # True opponent hidden card values for belief loss
 
 
 class RolloutBuffer:
@@ -54,6 +57,8 @@ class RolloutBuffer:
         
         self.transitions: List[Transition] = []
         self.episode_start_idx = 0
+        self._cache: dict = {}  # holds pre-computed tensors; keyed by attribute name
+        self._cached_n: int = 0
         
     def add(self, transition: Transition) -> None:
         """Add a transition to the buffer."""
@@ -63,29 +68,13 @@ class RolloutBuffer:
         """Clear all stored transitions and cached tensors."""
         self.transitions.clear()
         self.episode_start_idx = 0
-        # Clear cached tensors
+        self._cache.clear()
         self._cached_n = 0
-        if hasattr(self, '_cached_obs'):
-            del self._cached_obs
-        if hasattr(self, '_cached_actions'):
-            del self._cached_actions
-        if hasattr(self, '_cached_log_probs'):
-            del self._cached_log_probs
-        if hasattr(self, '_cached_masks'):
-            del self._cached_masks
-        if hasattr(self, '_cached_values'):
-            del self._cached_values
-        if hasattr(self, '_cached_player_ids'):
-            del self._cached_player_ids
     
     @property
     def size(self) -> int:
         """Number of stored transitions."""
         return len(self.transitions)
-    
-    def is_full(self) -> bool:
-        """Deprecated: 에피소드 기반 수집에서는 사용하지 않음."""
-        return False
     
     def compute_returns_and_advantages(
         self,
@@ -188,7 +177,7 @@ class RolloutBuffer:
         n = len(self.transitions)
         
         # Pre-compute all arrays once (avoid repeated list comprehensions)
-        if not hasattr(self, '_cached_tensors') or self._cached_n != n:
+        if not hasattr(self, '_cache') or self._cached_n != n:
             self._cache_tensors()
             self._cached_n = n
         
@@ -199,40 +188,45 @@ class RolloutBuffer:
             
             # Use pre-computed tensors with indexing
             batch_obs = {
-                key: self._cached_obs[key][batch_indices]
-                for key in self._cached_obs.keys()
+                key: self._cache['obs'][key][batch_indices]
+                for key in self._cache['obs']
             }
             
             batch_actions = {
-                key: self._cached_actions[key][batch_indices]
-                for key in self._cached_actions.keys()
+                key: self._cache['actions'][key][batch_indices]
+                for key in self._cache['actions']
             }
             
             batch_old_log_probs = {
-                key: self._cached_log_probs[key][batch_indices]
-                for key in self._cached_log_probs.keys()
+                key: self._cache['log_probs'][key][batch_indices]
+                for key in self._cache['log_probs']
             }
             
             batch_action_mask = None
-            if self._cached_masks is not None:
+            if self._cache.get('masks') is not None:
                 batch_action_mask = {
-                    key: self._cached_masks[key][batch_indices]
-                    for key in self._cached_masks.keys()
+                    key: self._cache['masks'][key][batch_indices]
+                    for key in self._cache['masks']
                 }
             
-            batch_old_values = self._cached_values[batch_indices]
+            batch_old_values = self._cache['values'][batch_indices]
             batch_returns = torch.from_numpy(returns[batch_indices]).float().to(self.device)
             batch_advantages = torch.from_numpy(advantages[batch_indices]).float().to(self.device)
             
+            batch_hidden_values = None
+            if self._cache.get('hidden_values') is not None:
+                batch_hidden_values = self._cache['hidden_values'][batch_indices]
+            
             yield {
                 "obs": batch_obs,
-                "player_id": self._cached_player_ids[batch_indices],
+                "player_id": self._cache['player_ids'][batch_indices],
                 "actions": batch_actions,
                 "old_log_probs": batch_old_log_probs,
                 "action_mask": batch_action_mask,
                 "old_values": batch_old_values,
                 "returns": batch_returns,
-                "advantages": batch_advantages
+                "advantages": batch_advantages,
+                "hidden_values": batch_hidden_values
             }
     
     def _cache_tensors(self) -> None:
@@ -240,7 +234,7 @@ class RolloutBuffer:
         n = len(self.transitions)
         
         # Cache observations
-        self._cached_obs = {
+        self._cache['obs'] = {
             key: torch.from_numpy(
                 np.stack([self.transitions[i].obs[key] for i in range(n)])
             ).float().to(self.device)
@@ -248,38 +242,46 @@ class RolloutBuffer:
         }
         
         # Cache player IDs
-        self._cached_player_ids = torch.from_numpy(
+        self._cache['player_ids'] = torch.from_numpy(
             np.array([t.player_id for t in self.transitions])
         ).long().to(self.device)
         
-        # Cache actions
-        self._cached_actions = {
+        # Cache actions — ACTION_KEYS defines index ↔ name mapping
+        self._cache['actions'] = {
             key: torch.from_numpy(
                 np.array([self.transitions[i].action[k_idx] for i in range(n)])
             ).long().to(self.device)
-            for k_idx, key in enumerate(["color", "position", "value", "decision"])
+            for k_idx, key in enumerate(ACTION_KEYS)
         }
         
         # Cache old log probs
-        self._cached_log_probs = {
+        self._cache['log_probs'] = {
             key: torch.from_numpy(
                 np.array([self.transitions[i].log_probs.get(key, 0.0) for i in range(n)])
             ).float().to(self.device)
-            for key in ["color", "position", "value", "decision"]
+            for key in ACTION_KEYS
         }
         
         # Cache action masks
         if self.transitions[0].action_mask is not None:
-            self._cached_masks = {
+            self._cache['masks'] = {
                 key: torch.from_numpy(
                     np.stack([self.transitions[i].action_mask[key] for i in range(n)])
                 ).bool().to(self.device)
                 for key in self.transitions[0].action_mask.keys()
             }
         else:
-            self._cached_masks = None
+            self._cache['masks'] = None
         
         # Cache old values
-        self._cached_values = torch.from_numpy(
+        self._cache['values'] = torch.from_numpy(
             np.array([t.value for t in self.transitions])
         ).float().to(self.device)
+        
+        # Cache hidden values for belief loss
+        if self.transitions[0].hidden_values is not None:
+            self._cache['hidden_values'] = torch.from_numpy(
+                np.stack([t.hidden_values for t in self.transitions])
+            ).long().to(self.device)
+        else:
+            self._cache['hidden_values'] = None

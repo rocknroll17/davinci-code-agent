@@ -92,25 +92,6 @@ class Deck:
         
         return drawn_cards
     
-    # def draw_random(self) -> Optional[Card]:
-    #     """
-    #     Draw a random card from the deck.
-        
-    #     Returns:
-    #         Randomly drawn card, or None if deck is empty
-    #     """
-    #     available = []
-    #     if self._black_cards:
-    #         available.append(Color.BLACK)
-    #     if self._white_cards:
-    #         available.append(Color.WHITE)
-        
-    #     if not available:
-    #         return None
-        
-    #     chosen_color = self._rng.choice(available)
-    #     return self.draw(chosen_color)
-    
     @property
     def black_count(self) -> int:
         """Number of black cards remaining."""

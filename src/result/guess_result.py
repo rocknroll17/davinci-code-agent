@@ -12,10 +12,7 @@ class GuessResult(Result):
         return str(self)
     
     def __str__(self) -> str:
-        try:
-            if self.is_invalid:
-                return f"Player {self.player_id} made an invalid guess."
-            return f"Player {self.player_id} {'Invalid ' if self.is_invalid else ''}guessed '{self.guessed_value}' at position {self.position} which is {'O' if self.is_correct else 'X'}"
-        except Exception as e:
-            raise RuntimeError(f"Error in __str__ of GuessResult: {e}") from e
+        if self.is_invalid:
+            return f"Player {self.player_id} made an invalid guess."
+        return f"Player {self.player_id} guessed '{self.guessed_value}' at position {self.position} which is {'O' if self.is_correct else 'X'}"
         

@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from typing import Dict, Optional, Tuple, List, Callable
+from typing import Any, Dict, Optional, Tuple, List, Callable
 from dataclasses import dataclass
 import json
 from datetime import datetime
@@ -22,34 +22,38 @@ from src.vec_env import VectorDaVinciEnv, SubprocVecEnv
 from src.constants import (
     CardValue, Phase, Color,
     REWARD_DRAW_WIN, REWARD_DRAW_LOSE,
-    REWARD_CONTINUE_SUCCESS, REWARD_CONTINUE_FAIL
+    REWARD_LOSE, REWARD_CONTINUE_SUCCESS, REWARD_CONTINUE_FAIL
 )
 from src.result.result import Result
 from src.result.guess_result import GuessResult
 from src.result.streak_result import StreakResult
 from src.visualizer import DaVinciVisualizer, get_visualizer
 
+import logging
+logger = logging.getLogger(__name__)
+
 @dataclass
 class PPOConfig:
     """PPO training configuration."""
     # Training
     total_timesteps: int = 1000000000
-    learning_rate: float = 0.5e-5  # Reduced LR for fine-grained optimization
-    n_envs: int = 1000  # 많을수록 step당 수집량 ↑ → pipe 왕복 줄임
-    episodes_per_update: int = 1000  # n_envs와 동일 → ~1라운드로 수집 완료
-    batch_size: int = 2048  # GPU 효율적 배치
-    n_epochs: int = 8  # More passes for thorough optimization
+    learning_rate: float =8e-5  # CNN 시절 1.25e-4에서 소폭 낮춤 (Transformer 안정성)
+    n_envs: int =300  # 수집 병목 해소: epu=20 채우는 시간 최소화
+    episodes_per_update: int = 300 # n_envs와 동일 → ~1라운드로 수집 완료
+    batch_size: int = 1096  # CNN 시절 8192에서 절충 (메모리×에피소드 량 고려)
+    n_epochs: int = 8  # 에포크 늘려 데이터 재사용 극대화
     
     # PPO specific
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_range: float = 0.07  # Tighter clip for precise updates
-    clip_range_vf: float = 0.07  # Match policy clip range
-    ent_coef: float = 0.002  # Minimal entropy → full exploitation
-    color_ent_coef: float = 0.05  # Higher entropy for color head → diverse draw exploration
+    clip_range: float = 0.2   # 0.15→0.2: policy 업데이트 폭 확대, plateau 탈출
+    clip_range_vf: float = 10.0  # 리턴 스케일 [-30,+30]에 맞춤 — 0.2는 절대값 clip이라 value 업데이트 과도 제한
+    ent_coef: float = 0.01  # 0.03→0.01: plateau 단계에서 entropy 너무 높으면 수렴 방해
+    color_ent_coef: float = 0.02  # ent_coef 2x 비율 유지
     vf_coef: float = 0.5  # Value function coefficient
+    belief_coef: float = 0.2   # 0.5→0.2: 인코더가 RL/belief 양방향 gradient 동시 수신 → value feature 훼손 방지
     max_grad_norm: float = 0.5
-    lr_end: float = 5e-6  # Lower floor for gradual decay
+    lr_end: float = 3e-5  # 1e-5→3e-5: plateau 단계에서 LR floor 상향
     
     # Model
     hidden_dim: int = 512
@@ -110,7 +114,7 @@ class PPOTrainer:
         
         # LR Scheduler: linear decay from learning_rate to lr_end
         # 에피소드당 평균 ~60 스텝 추정
-        avg_steps_per_episode = 60
+        avg_steps_per_episode = 45  # 실측 평균 ~45 steps/ep (이전 60은 과다 추정)
         total_updates = config.total_timesteps // (config.episodes_per_update * avg_steps_per_episode)
         self.scheduler = optim.lr_scheduler.LinearLR(
             self.optimizer,
@@ -162,6 +166,7 @@ class PPOTrainer:
         self.losses: Dict[str, List[float]] = {
             "policy_loss": [],
             "value_loss": [],
+            "belief_loss": [],
             "entropy": [],  # Changed from entropy_loss
             "total_loss": []
         }
@@ -175,9 +180,28 @@ class PPOTrainer:
             'joker_miss': 0,            # 조커 놓침
         }
         
+        # Training hooks (see src/hooks.py)
+        self._hooks: List = []
+
         # Create directories
         os.makedirs(config.save_dir, exist_ok=True)
         os.makedirs(config.log_dir, exist_ok=True)
+
+    def register_hook(self, hook) -> None:
+        """Register a ``TrainingHook`` callback (see ``src.hooks``)."""
+        self._hooks.append(hook)
+
+    def _call_hooks_update(self, stats: Dict[str, Any]) -> None:
+        for h in self._hooks:
+            h.on_update_end(self, stats)
+
+    def _call_hooks_eval(self, eval_stats: Dict[str, Any]) -> None:
+        for h in self._hooks:
+            h.on_eval_end(self, eval_stats)
+
+    def _call_hooks_end(self) -> None:
+        for h in self._hooks:
+            h.on_training_end(self)
 
     def _save_obs_tensor(self, obs_tensor: Dict[str, torch.Tensor], player: int) -> None:
         """
@@ -503,170 +527,235 @@ class PPOTrainer:
         else:
             return self._collect_rollouts_threaded()
     
+    # -------------------------------------------------------------------------
+    # Rollout helpers — shared by threaded and subproc collection
+    # -------------------------------------------------------------------------
+
+    def _recompute_finetune_log_probs(
+        self,
+        obs_tensor: Dict[str, torch.Tensor],
+        action_mask_tensor: Dict[str, torch.Tensor],
+        actions: np.ndarray,
+        custom_overrides: Dict[int, Dict],
+        log_probs_np_all: Dict[str, np.ndarray],
+    ) -> None:
+        """Fix PPO importance ratios when finetune overrides an action.
+
+        The stored log_probs correspond to the original sampled action, so the
+        PPO ratio becomes π_new(a_override) / π_old(a_original), which is wrong.
+        This method replaces the stale entries in *log_probs_np_all* in-place.
+        """
+        override_indices = [idx for idx, ov in custom_overrides.items() if "action" in ov]
+        if not override_indices:
+            return
+        with torch.no_grad():
+            ov_idx = np.array(override_indices)
+            ov_obs = {k: obs_tensor[k][ov_idx] for k in obs_tensor}
+            ov_masks = {k: action_mask_tensor[k][ov_idx] for k in action_mask_tensor}
+            ov_actions = {
+                key: torch.from_numpy(actions[ov_idx, k_idx].copy()).long().to(self.device)
+                for k_idx, key in enumerate(["color", "position", "value", "decision"])
+            }
+            new_log_probs, _, _, _ = self.policy.evaluate_actions(ov_obs, ov_actions, ov_masks)
+            for local_idx, global_idx in enumerate(override_indices):
+                for k in log_probs_np_all:
+                    log_probs_np_all[k][global_idx] = new_log_probs[k][local_idx].cpu().item()
+
+    def _add_transition_and_track(
+        self,
+        i: int,
+        obs: Dict[str, np.ndarray],
+        actions: np.ndarray,
+        rewards: np.ndarray,
+        dones: np.ndarray,
+        results: List,
+        next_infos: List[Dict],
+        log_probs_np_all: Dict[str, np.ndarray],
+        values_np_all: np.ndarray,
+        action_masks_np: Dict[str, np.ndarray],
+        per_env_tracking: List[Dict],
+        episode_rewards: np.ndarray,
+        episode_lengths: np.ndarray,
+    ) -> int:
+        """Build a Transition, add it to the buffer, and update per-step tracking.
+
+        Returns the buffer index of the added transition.
+        """
+        def _safe_float(x: float) -> float:
+            return float(x) if not (np.isnan(x) or np.isinf(x)) else 0.0
+
+        obs_copy = {k: np.array(v[i], copy=True) for k, v in obs.items()}
+        mask_copy = {k: np.array(v[i], copy=True) for k, v in action_masks_np.items()}
+        hv = next_infos[i].get("hidden_values")
+        transition = Transition(
+            obs=obs_copy,
+            player_id=int(results[i].player_id) if hasattr(results[i], "player_id") else 0,
+            action=np.array(actions[i], copy=True),
+            reward=_safe_float(rewards[i]),
+            done=bool(dones[i]),
+            log_probs={k: _safe_float(v[i]) for k, v in log_probs_np_all.items()},
+            value=_safe_float(values_np_all[i]),
+            action_mask=mask_copy,
+            env_id=i,
+            hidden_values=np.array(hv, copy=True) if hv is not None else None,
+        )
+        self.buffer.add(transition)
+        buffer_idx = self.buffer.size - 1
+        self.timesteps += 1
+
+        if np.argmax(obs["phase"][i]) == Phase.DRAW.value:
+            per_env_tracking[i]["draw_indices"].append(buffer_idx)
+
+        result_i = results[i]
+        if result_i is not None and isinstance(result_i, StreakResult) and not result_i.is_invalid:
+            if result_i.is_continue:
+                per_env_tracking[i]["last_continue_idx"] = buffer_idx
+
+        if result_i is not None and isinstance(result_i, GuessResult) and not result_i.is_invalid:
+            cont_idx = per_env_tracking[i]["last_continue_idx"]
+            if cont_idx is not None:
+                bonus = REWARD_CONTINUE_SUCCESS if result_i.is_correct else REWARD_CONTINUE_FAIL
+                self.buffer.transitions[cont_idx].reward += bonus
+                per_env_tracking[i]["last_continue_idx"] = None
+
+        episode_rewards[i] += rewards[i]
+        episode_lengths[i] += 1
+        return buffer_idx
+
+    def _close_episode(
+        self,
+        i: int,
+        obs: Dict[str, np.ndarray],
+        next_obs: Dict[str, np.ndarray],
+        per_env_tracking: List[Dict],
+        episode_rewards: np.ndarray,
+        episode_lengths: np.ndarray,
+        completed_rewards: List[float],
+        completed_lengths: List[float],
+        finetune_pbar,
+        winner: Optional[int],
+        reset_obs: Optional[Dict[str, np.ndarray]],
+    ) -> None:
+        """Apply end-of-episode rewards, flush tracking state, and reset counters.
+
+        *reset_obs* is applied to next_obs[i] when provided (threaded passes the
+        result of reset_single(); subproc passes the obs from info['_reset_obs']).
+        """
+        if winner is not None:
+            for buf_idx in per_env_tracking[i]["draw_indices"]:
+                if buf_idx < len(self.buffer.transitions):
+                    t = self.buffer.transitions[buf_idx]
+                    t.reward += REWARD_DRAW_WIN if t.player_id == winner else REWARD_DRAW_LOSE
+            loser = 1 - winner
+            for search_idx in range(len(self.buffer.transitions) - 1, -1, -1):
+                t = self.buffer.transitions[search_idx]
+                if t.env_id == i and t.player_id == loser:
+                    t.reward += REWARD_LOSE
+                    break
+        per_env_tracking[i]["draw_indices"] = []
+        per_env_tracking[i]["last_continue_idx"] = None
+
+        completed_rewards.append(episode_rewards[i])
+        completed_lengths.append(episode_lengths[i])
+        self.episodes += 1
+        if finetune_pbar is not None:
+            finetune_pbar.update(1)
+        if reset_obs is not None:
+            for k in obs:
+                next_obs[k][i] = reset_obs[k]
+        episode_rewards[i] = 0.0
+        episode_lengths[i] = 0
+
+    # -------------------------------------------------------------------------
+
     def _collect_rollouts_threaded(self) -> Dict[str, float]:
         """Original thread-based rollout collection (VectorDaVinciEnv)."""
         self.buffer.clear()
-        import logging
-        logger = logging.getLogger()
-        
         obs, infos = self.vec_env.reset()
         logger.info(f"Starting rollout collection with {self.n_envs} parallel envs (threaded)")
-        
+
         episode_rewards = np.zeros(self.n_envs, dtype=np.float32)
         episode_lengths = np.zeros(self.n_envs, dtype=np.int32)
-        completed_rewards = []
-        completed_lengths = []
-        
-        per_env_reward_tracking = [{
-            'draw_indices': [],
-            'last_continue_idx': None
-        } for _ in range(self.n_envs)]
-        
+        completed_rewards: List[float] = []
+        completed_lengths: List[float] = []
+        per_env_tracking = [{"draw_indices": [], "last_continue_idx": None} for _ in range(self.n_envs)]
         steps_collected = 0
         episodes_collected = 0
         target_episodes = self.config.episodes_per_update
-        
+
         finetune_pbar = None
         if self.config.finetune:
             from tqdm import tqdm
             finetune_pbar = tqdm(total=target_episodes, desc="🎯 Finetune episodes", unit="ep", ncols=80)
-        
+
         while episodes_collected < target_episodes:
             action_masks_np = self.vec_env.get_action_masks()
             obs_tensor = self._batch_obs_to_tensor(obs)
             action_mask_tensor = self._batch_mask_to_tensor(action_masks_np)
-            
+
             with torch.no_grad():
                 actions, log_probs, values = self.policy.get_action(obs_tensor, action_mask_tensor)
-            
+
             custom_overrides = {}
             if self.config.finetune:
                 custom_overrides = self._check_custom_training_cases(obs, action_masks_np, actions)
                 for env_idx, override in custom_overrides.items():
-                    if 'action' in override:
-                        actions[env_idx] = override['action']
-            
+                    if "action" in override:
+                        actions[env_idx] = override["action"]
+
             next_obs, rewards, terminated, truncated, next_infos, results = self.vec_env.step(actions)
             dones = terminated | truncated
-            
+
             if self.config.finetune:
                 for env_idx, override in custom_overrides.items():
-                    if 'reward' in override:
-                        rewards[env_idx] = override['reward']
-                    elif 'reward_bonus' in override:
-                        rewards[env_idx] += override['reward_bonus']
-            
+                    if "reward" in override:
+                        rewards[env_idx] = override["reward"]
+                    elif "reward_bonus" in override:
+                        rewards[env_idx] += override["reward_bonus"]
+
             log_probs_np_all = {k: v.cpu().numpy() for k, v in log_probs.items()}
             values_np_all = values.cpu().numpy().flatten()
-            
-            # Recompute log_probs for overridden actions (finetune action intervention)
-            # Without this, PPO ratio = π_new(a_override) / π_old(a_original) which is wrong
+
             if self.config.finetune and custom_overrides:
-                override_action_indices = [idx for idx, ov in custom_overrides.items() if 'action' in ov]
-                if override_action_indices:
-                    with torch.no_grad():
-                        ov_idx = np.array(override_action_indices)
-                        ov_obs = {k: obs_tensor[k][ov_idx] for k in obs_tensor.keys()}
-                        ov_masks = {k: action_mask_tensor[k][ov_idx] for k in action_mask_tensor.keys()}
-                        ov_actions_np = actions[ov_idx]
-                        ov_actions = {
-                            key: torch.from_numpy(ov_actions_np[:, k_idx].copy()).long().to(self.device)
-                            for k_idx, key in enumerate(["color", "position", "value", "decision"])
-                        }
-                        new_log_probs, _, _ = self.policy.evaluate_actions(ov_obs, ov_actions, ov_masks)
-                        for local_idx, global_idx in enumerate(override_action_indices):
-                            for k in log_probs_np_all:
-                                log_probs_np_all[k][global_idx] = new_log_probs[k][local_idx].cpu().item()
-            
-            for i in range(self.n_envs):
-                obs_copy = {k: np.array(v[i], copy=True) for k, v in obs.items()}
-                mask_copy = {k: np.array(v[i], copy=True) for k, v in action_masks_np.items()}
-                action_copy = np.array(actions[i], copy=True)
-                rew = float(rewards[i]) if not np.isnan(rewards[i]) and not np.isinf(rewards[i]) else 0.0
-                done_flag = bool(dones[i])
-                log_probs_np = {k: float(v[i]) if not np.isnan(v[i]) and not np.isinf(v[i]) else 0.0 for k, v in log_probs_np_all.items()}
-                value_np = float(values_np_all[i]) if not np.isnan(values_np_all[i]) and not np.isinf(values_np_all[i]) else 0.0
-                transition = Transition(
-                    obs=obs_copy,
-                    player_id=int(results[i].player_id) if hasattr(results[i], 'player_id') else 0,
-                    action=action_copy,
-                    reward=rew,
-                    done=done_flag,
-                    log_probs=log_probs_np,
-                    value=value_np,
-                    action_mask=mask_copy,
-                    env_id=i
+                self._recompute_finetune_log_probs(
+                    obs_tensor, action_mask_tensor, actions, custom_overrides, log_probs_np_all
                 )
-                self.buffer.add(transition)
-                buffer_idx = self.buffer.size - 1
+
+            for i in range(self.n_envs):
+                self._add_transition_and_track(
+                    i, obs, actions, rewards, dones, results, next_infos,
+                    log_probs_np_all, values_np_all, action_masks_np,
+                    per_env_tracking, episode_rewards, episode_lengths,
+                )
                 steps_collected += 1
-                
-                phase_idx = np.argmax(obs['phase'][i])
-                if phase_idx == Phase.DRAW.value:
-                    per_env_reward_tracking[i]['draw_indices'].append(buffer_idx)
-                
-                result_i = results[i]
-                if result_i is not None and isinstance(result_i, StreakResult) and not result_i.is_invalid:
-                    if result_i.is_continue:
-                        per_env_reward_tracking[i]['last_continue_idx'] = buffer_idx
-                
-                if result_i is not None and isinstance(result_i, GuessResult) and not result_i.is_invalid:
-                    cont_idx = per_env_reward_tracking[i]['last_continue_idx']
-                    if cont_idx is not None:
-                        if result_i.is_correct:
-                            self.buffer.transitions[cont_idx].reward += REWARD_CONTINUE_SUCCESS
-                        else:
-                            self.buffer.transitions[cont_idx].reward += REWARD_CONTINUE_FAIL
-                        per_env_reward_tracking[i]['last_continue_idx'] = None
-                
-                episode_rewards[i] += rewards[i]
-                episode_lengths[i] += 1
-                self.timesteps += 1
-                
+
                 if dones[i]:
                     winner = self.vec_env.envs[i]._winner
-                    if winner is not None:
-                        for buf_idx in per_env_reward_tracking[i]['draw_indices']:
-                            if buf_idx < len(self.buffer.transitions):
-                                t = self.buffer.transitions[buf_idx]
-                                if t.player_id == winner:
-                                    t.reward += REWARD_DRAW_WIN
-                                else:
-                                    t.reward += REWARD_DRAW_LOSE
-                    per_env_reward_tracking[i]['draw_indices'] = []
-                    per_env_reward_tracking[i]['last_continue_idx'] = None
-                    
-                    completed_rewards.append(episode_rewards[i])
-                    completed_lengths.append(episode_lengths[i])
-                    self.episodes += 1
+                    new_obs, next_infos[i] = self.vec_env.reset_single(i)
+                    self._close_episode(
+                        i, obs, next_obs, per_env_tracking,
+                        episode_rewards, episode_lengths,
+                        completed_rewards, completed_lengths,
+                        finetune_pbar, winner, new_obs,
+                    )
                     episodes_collected += 1
-                    
-                    if finetune_pbar is not None:
-                        finetune_pbar.update(1)
-                    
-                    new_obs, new_info = self.vec_env.reset_single(i)
-                    for k in obs.keys():
-                        next_obs[k][i] = new_obs[k]
-                    next_infos[i] = new_info
-                    episode_rewards[i] = 0.0
-                    episode_lengths[i] = 0
-            
+
             viz = get_visualizer()
             if viz is not None:
                 self._update_viz_from_vec(viz, rewards[0], episode_rewards[0], actions[0], results[0])
-            
+
             obs = next_obs
             infos = next_infos
-        
+
         if finetune_pbar is not None:
             finetune_pbar.close()
-        
+
         return self._finalize_rollouts(obs, completed_rewards, completed_lengths, steps_collected)
-    
+
     def _collect_rollouts_subproc(self) -> Dict[str, float]:
         """
         Multiprocessing-based rollout collection (SubprocVecEnv).
-        
+
         Key differences from threaded version:
         - env.step() runs in parallel worker processes (true CPU parallelism)
         - Finetune case checking runs inside workers (no GIL bottleneck)
@@ -674,181 +763,97 @@ class PPOTrainer:
         - Winner info comes from info dict (not direct env access)
         """
         self.buffer.clear()
-        import logging
-        logger = logging.getLogger()
-        
         obs, infos = self.vec_env.reset()
         logger.info(f"Starting rollout collection with {self.n_envs} parallel envs (multiprocess)")
-        
+
         episode_rewards = np.zeros(self.n_envs, dtype=np.float32)
         episode_lengths = np.zeros(self.n_envs, dtype=np.int32)
-        completed_rewards = []
-        completed_lengths = []
-        
-        per_env_reward_tracking = [{
-            'draw_indices': [],
-            'last_continue_idx': None
-        } for _ in range(self.n_envs)]
-        
+        completed_rewards: List[float] = []
+        completed_lengths: List[float] = []
+        per_env_tracking = [{"draw_indices": [], "last_continue_idx": None} for _ in range(self.n_envs)]
         steps_collected = 0
         episodes_collected = 0
         target_episodes = self.config.episodes_per_update
-        
+
         finetune_pbar = None
         if self.config.finetune:
             from tqdm import tqdm
             finetune_pbar = tqdm(total=target_episodes, desc="🎯 Finetune episodes", unit="ep", ncols=80)
-        
+
         while episodes_collected < target_episodes:
             action_masks_np = self.vec_env.get_action_masks()
             obs_tensor = self._batch_obs_to_tensor(obs)
             action_mask_tensor = self._batch_mask_to_tensor(action_masks_np)
-            
+
             with torch.no_grad():
                 actions, log_probs, values = self.policy.get_action(obs_tensor, action_mask_tensor)
-            
+
             # Step environments (finetune checks run inside workers)
             if self.config.finetune:
                 next_obs, rewards, terminated, truncated, next_infos, results, custom_overrides = \
                     self.vec_env.step_finetune(actions)
-                # Sync overridden actions back to trainer (critical: buffer must store actual executed action)
+                # Sync overridden actions back to trainer so the buffer stores the actual executed action
                 for env_idx, override in custom_overrides.items():
-                    if 'action' in override:
-                        actions[env_idx] = override['action']
+                    if "action" in override:
+                        actions[env_idx] = override["action"]
                 # Update finetune stats from worker overrides
                 for env_idx, override in custom_overrides.items():
-                    case_type = override.get('case_type', '')
-                    if case_type == 'impossible_guess':
-                        self.finetune_stats['impossible_guess_penalty'] += 1
-                    elif case_type == 'joker_correct':
-                        self.finetune_stats['joker_correct'] += 1
-                        sv = override.get('surrounding_value')
+                    case_type = override.get("case_type", "")
+                    if case_type == "impossible_guess":
+                        self.finetune_stats["impossible_guess_penalty"] += 1
+                    elif case_type == "joker_correct":
+                        self.finetune_stats["joker_correct"] += 1
+                        sv = override.get("surrounding_value")
                         if sv is not None:
-                            self.finetune_stats['joker_by_value'][sv] += 1
-                    elif case_type == 'joker_intervention':
-                        self.finetune_stats['joker_intervention'] += 1
-                        sv = override.get('surrounding_value')
+                            self.finetune_stats["joker_by_value"][sv] += 1
+                    elif case_type == "joker_intervention":
+                        self.finetune_stats["joker_intervention"] += 1
+                        sv = override.get("surrounding_value")
                         if sv is not None:
-                            self.finetune_stats['joker_by_value'][sv] += 1
-                    elif case_type == 'joker_miss':
-                        self.finetune_stats['joker_miss'] += 1
+                            self.finetune_stats["joker_by_value"][sv] += 1
+                    elif case_type == "joker_miss":
+                        self.finetune_stats["joker_miss"] += 1
             else:
-                next_obs, rewards, terminated, truncated, next_infos, results = \
-                    self.vec_env.step(actions)
+                next_obs, rewards, terminated, truncated, next_infos, results = self.vec_env.step(actions)
                 custom_overrides = {}
-            
+
             dones = terminated | truncated
-            
+
             log_probs_np_all = {k: v.cpu().numpy() for k, v in log_probs.items()}
             values_np_all = values.cpu().numpy().flatten()
-            
-            # Recompute log_probs for overridden actions (finetune action intervention)
-            # Without this, PPO ratio = π_new(a_override) / π_old(a_original) which is wrong
+
             if self.config.finetune and custom_overrides:
-                override_action_indices = [idx for idx, ov in custom_overrides.items() if 'action' in ov]
-                if override_action_indices:
-                    with torch.no_grad():
-                        ov_idx = np.array(override_action_indices)
-                        ov_obs = {k: obs_tensor[k][ov_idx] for k in obs_tensor.keys()}
-                        ov_masks = {k: action_mask_tensor[k][ov_idx] for k in action_mask_tensor.keys()}
-                        ov_actions_np = actions[ov_idx]
-                        ov_actions = {
-                            key: torch.from_numpy(ov_actions_np[:, k_idx].copy()).long().to(self.device)
-                            for k_idx, key in enumerate(["color", "position", "value", "decision"])
-                        }
-                        new_log_probs, _, _ = self.policy.evaluate_actions(ov_obs, ov_actions, ov_masks)
-                        for local_idx, global_idx in enumerate(override_action_indices):
-                            for k in log_probs_np_all:
-                                log_probs_np_all[k][global_idx] = new_log_probs[k][local_idx].cpu().item()
-            
-            for i in range(self.n_envs):
-                obs_copy = {k: np.array(v[i], copy=True) for k, v in obs.items()}
-                mask_copy = {k: np.array(v[i], copy=True) for k, v in action_masks_np.items()}
-                action_copy = np.array(actions[i], copy=True)
-                rew = float(rewards[i]) if not np.isnan(rewards[i]) and not np.isinf(rewards[i]) else 0.0
-                done_flag = bool(dones[i])
-                log_probs_np = {k: float(v[i]) if not np.isnan(v[i]) and not np.isinf(v[i]) else 0.0 for k, v in log_probs_np_all.items()}
-                value_np = float(values_np_all[i]) if not np.isnan(values_np_all[i]) and not np.isinf(values_np_all[i]) else 0.0
-                transition = Transition(
-                    obs=obs_copy,
-                    player_id=int(results[i].player_id) if hasattr(results[i], 'player_id') else 0,
-                    action=action_copy,
-                    reward=rew,
-                    done=done_flag,
-                    log_probs=log_probs_np,
-                    value=value_np,
-                    action_mask=mask_copy,
-                    env_id=i
+                self._recompute_finetune_log_probs(
+                    obs_tensor, action_mask_tensor, actions, custom_overrides, log_probs_np_all
                 )
-                self.buffer.add(transition)
-                buffer_idx = self.buffer.size - 1
+
+            for i in range(self.n_envs):
+                self._add_transition_and_track(
+                    i, obs, actions, rewards, dones, results, next_infos,
+                    log_probs_np_all, values_np_all, action_masks_np,
+                    per_env_tracking, episode_rewards, episode_lengths,
+                )
                 steps_collected += 1
-                
-                phase_idx = np.argmax(obs['phase'][i])
-                if phase_idx == Phase.DRAW.value:
-                    per_env_reward_tracking[i]['draw_indices'].append(buffer_idx)
-                
-                result_i = results[i]
-                if result_i is not None and isinstance(result_i, StreakResult) and not result_i.is_invalid:
-                    if result_i.is_continue:
-                        per_env_reward_tracking[i]['last_continue_idx'] = buffer_idx
-                
-                if result_i is not None and isinstance(result_i, GuessResult) and not result_i.is_invalid:
-                    cont_idx = per_env_reward_tracking[i]['last_continue_idx']
-                    if cont_idx is not None:
-                        if result_i.is_correct:
-                            self.buffer.transitions[cont_idx].reward += REWARD_CONTINUE_SUCCESS
-                        else:
-                            self.buffer.transitions[cont_idx].reward += REWARD_CONTINUE_FAIL
-                        per_env_reward_tracking[i]['last_continue_idx'] = None
-                
-                episode_rewards[i] += rewards[i]
-                episode_lengths[i] += 1
-                self.timesteps += 1
-                
+
                 if dones[i]:
-                    # Get winner from info dict (auto-reset, env is in worker process)
-                    winner = next_infos[i].get('_winner')
-                    if winner is not None:
-                        for buf_idx in per_env_reward_tracking[i]['draw_indices']:
-                            if buf_idx < len(self.buffer.transitions):
-                                t = self.buffer.transitions[buf_idx]
-                                if t.player_id == winner:
-                                    t.reward += REWARD_DRAW_WIN
-                                else:
-                                    t.reward += REWARD_DRAW_LOSE
-                    per_env_reward_tracking[i]['draw_indices'] = []
-                    per_env_reward_tracking[i]['last_continue_idx'] = None
-                    
-                    completed_rewards.append(episode_rewards[i])
-                    completed_lengths.append(episode_lengths[i])
-                    self.episodes += 1
+                    winner = next_infos[i].get("_winner")
+                    reset_obs = next_infos[i].get("_reset_obs")
+                    self._close_episode(
+                        i, obs, next_obs, per_env_tracking,
+                        episode_rewards, episode_lengths,
+                        completed_rewards, completed_lengths,
+                        finetune_pbar, winner, reset_obs,
+                    )
                     episodes_collected += 1
-                    
-                    if finetune_pbar is not None:
-                        finetune_pbar.update(1)
-                    
-                    # Auto-reset: use reset obs from info dict
-                    if '_reset_obs' in next_infos[i]:
-                        reset_obs = next_infos[i]['_reset_obs']
-                        for k in obs.keys():
-                            next_obs[k][i] = reset_obs[k]
-                    
-                    episode_rewards[i] = 0.0
-                    episode_lengths[i] = 0
-            
-            viz = get_visualizer()
-            if viz is not None and not self._use_subproc:
-                self._update_viz_from_vec(viz, rewards[0], episode_rewards[0], actions[0], results[0])
-            
+
             obs = next_obs
             infos = next_infos
-        
+
         if finetune_pbar is not None:
             finetune_pbar.close()
-        
+
         return self._finalize_rollouts(obs, completed_rewards, completed_lengths, steps_collected)
-    
+
     def _finalize_rollouts(
         self,
         obs: Dict[str, np.ndarray],
@@ -857,9 +862,6 @@ class PPOTrainer:
         steps_collected: int
     ) -> Dict[str, float]:
         """Compute GAE, normalize advantages, log stats. Shared by both collect methods."""
-        import logging
-        logger = logging.getLogger()
-        
         obs_tensor = self._batch_obs_to_tensor(obs)
         with torch.no_grad():
             _, _, last_values = self.policy.get_action(obs_tensor)
@@ -962,6 +964,7 @@ class PPOTrainer:
         """
         policy_losses = []
         value_losses = []
+        belief_losses = []
         entropy_losses = []
         
         for epoch in range(self.config.n_epochs):
@@ -971,7 +974,7 @@ class PPOTrainer:
                 self._advantages
             ):
                 # Evaluate current policy on batch
-                log_probs, values, entropies = self.policy.evaluate_actions(
+                log_probs, values, entropies, belief_logits = self.policy.evaluate_actions(
                     batch["obs"],
                     batch["actions"],
                     batch["action_mask"]
@@ -1047,12 +1050,68 @@ class PPOTrainer:
                 else:
                     value_loss = 0.5 * ((values - batch["returns"]) ** 2).mean()
                 
-                # Total loss: policy_loss - entropy_bonus + value_loss
+                # Total loss: policy_loss - entropy_bonus + value_loss + belief_loss
                 # We want to MAXIMIZE entropy, so we SUBTRACT it from loss
                 entropy_loss = -entropy_mean  # For logging (negative = good)
+                
+                # Auxiliary belief loss: predict opponent's hidden card values
+                # Impossible-value masking: values that are structurally impossible for a given
+                # opponent slot (same-color cards already in my hand, or already revealed by opp)
+                # are masked to -inf before CE so the model is penalised for assigning them prob.
+                belief_loss = torch.tensor(0.0, device=self.device)
+                if batch["hidden_values"] is not None:
+                    hidden_vals = batch["hidden_values"]  # (B, 13) with -1 for non-hidden
+                    # Only compute loss for positions that are actually hidden (value >= 0)
+                    hidden_mask = hidden_vals >= 0  # (B, 13)
+                    if hidden_mask.any():
+                        B = hidden_vals.shape[0]
+                        # Build impossible-value mask from observation
+                        obs_my  = batch["obs"]["my_hand"].long()         # (B, 13, 2)
+                        obs_opp = batch["obs"]["opponent_hand"].long()   # (B, 13, 2)
+                        my_c = obs_my[:, :, 0]   # (B, 13) color
+                        my_v = obs_my[:, :, 1]   # (B, 13) value; -2=empty slot
+                        my_valid = (my_v >= 0) & (my_v < 13)
+                        opp_c = obs_opp[:, :, 0]  # (B, 13) color always visible
+                        opp_v = obs_opp[:, :, 1]  # (B, 13) -1=hidden
+                        opp_rev_valid = (opp_v >= 0) & (opp_v < 13)
+                        # color-value bitmaps: [b, color(0/1), value(0-12)]
+                        my_bmp  = torch.zeros(B, 2, 13, dtype=torch.bool, device=self.device)
+                        opp_bmp = torch.zeros(B, 2, 13, dtype=torch.bool, device=self.device)
+                        b_range = torch.arange(B, device=self.device)
+                        for slot in range(13):
+                            vld = my_valid[:, slot]
+                            vb = b_range[vld]
+                            if vb.numel() > 0:
+                                my_bmp[vb,
+                                       my_c[:, slot][vld].clamp(0, 1),
+                                       my_v[:, slot][vld].clamp(0, 12)] = True
+                            vld = opp_rev_valid[:, slot]
+                            vb = b_range[vld]
+                            if vb.numel() > 0:
+                                opp_bmp[vb,
+                                        opp_c[:, slot][vld].clamp(0, 1),
+                                        opp_v[:, slot][vld].clamp(0, 12)] = True
+                        # For each opp slot pos: impossible[b,pos,v] = bitmap[b, opp_c[b,pos], v]
+                        # gather along dim=1 (color dim) of (B,2,13) → (B,13,13)
+                        color_idx = opp_c.clamp(0, 1).unsqueeze(2).expand(B, 13, 13)
+                        impossible = (
+                            my_bmp.gather(1, color_idx) |
+                            opp_bmp.gather(1, color_idx)
+                        )  # (B, 13, 13)
+                        # Flatten to active hidden positions
+                        flat_logits  = belief_logits[hidden_mask]  # (N, 13)
+                        flat_targets = hidden_vals[hidden_mask]     # (N,)
+                        flat_imp     = impossible[hidden_mask]      # (N, 13)
+                        # Safety: never mask the true label itself
+                        flat_imp.scatter_(1, flat_targets.clamp(0, 12).unsqueeze(1), False)
+                        # Apply: impossible values → -inf before softmax
+                        flat_logits = flat_logits.masked_fill(flat_imp, float('-inf'))
+                        belief_loss = nn.functional.cross_entropy(flat_logits, flat_targets)
+                
                 loss = (
                     policy_loss
                     + self.config.vf_coef * value_loss
+                    + self.config.belief_coef * belief_loss
                     - self.config.ent_coef * entropy_mean  # Subtract to maximize entropy
                 )
                 
@@ -1072,6 +1131,7 @@ class PPOTrainer:
                 
                 policy_losses.append(policy_loss.item())
                 value_losses.append(value_loss.item())
+                belief_losses.append(belief_loss.item())
                 entropy_losses.append(entropy_mean.item())  # Store actual entropy
         
         self.updates += 1
@@ -1080,9 +1140,11 @@ class PPOTrainer:
         mean_losses = {
             "policy_loss": np.mean(policy_losses) if policy_losses else 0.0,
             "value_loss": np.mean(value_losses) if value_losses else 0.0,
+            "belief_loss": np.mean(belief_losses) if belief_losses else 0.0,
             "entropy": np.mean(entropy_losses) if entropy_losses else 0.0,
             "total_loss": (np.mean(policy_losses) if policy_losses else 0.0) + 
-                         self.config.vf_coef * (np.mean(value_losses) if value_losses else 0.0) -
+                         self.config.vf_coef * (np.mean(value_losses) if value_losses else 0.0) +
+                         self.config.belief_coef * (np.mean(belief_losses) if belief_losses else 0.0) -
                          self.config.ent_coef * (np.mean(entropy_losses) if entropy_losses else 0.0)
         }
         
@@ -1184,8 +1246,21 @@ class PPOTrainer:
             path: Path to checkpoint
         """
         checkpoint = torch.load(path, map_location=self.device)
-        
-        self.policy.load_state_dict(checkpoint["policy_state_dict"])
+
+        # Filter out keys whose shape changed (e.g., belief_head after architecture update)
+        # strict=False only handles missing/unexpected keys, not shape mismatches
+        saved_state = checkpoint["policy_state_dict"]
+        model_state = self.policy.state_dict()
+        compatible = {k: v for k, v in saved_state.items()
+                      if k in model_state and v.shape == model_state[k].shape}
+        shape_mismatch = [k for k, v in saved_state.items()
+                          if k in model_state and v.shape != model_state[k].shape]
+        if shape_mismatch:
+            print(f"Shape mismatch — re-initialized: {shape_mismatch}")
+
+        missing, unexpected = self.policy.load_state_dict(compatible, strict=False)
+        if missing:
+            print(f"New parameters initialized randomly: {missing}")
         
         if self.config.reset_optimizer_on_load:
             # Reset optimizer with fresh state (useful after finetune→normal transition)
@@ -1208,7 +1283,7 @@ class PPOTrainer:
         for pg in self.optimizer.param_groups:
             pg['lr'] = self.config.learning_rate
         # Re-create scheduler from current point
-        avg_steps_per_episode = 60
+        avg_steps_per_episode = 45  # 실측 평균 ~45 steps/ep
         total_updates = self.config.total_timesteps // (self.config.episodes_per_update * avg_steps_per_episode)
         remaining = max(total_updates - self.updates, 1)
         self.scheduler = optim.lr_scheduler.LinearLR(
@@ -1251,7 +1326,8 @@ class PPOTrainer:
                       f"Mean Reward: {rollout_stats['mean_reward']:5.2f} | "
                       f"LR: {current_lr:.2e} | "
                       f"Policy Loss: {update_stats['policy_loss']:.4f} | "
-                      f"Value Loss: {update_stats['value_loss']:.4f}")
+                      f"Value Loss: {update_stats['value_loss']:.4f} | "
+                      f"Belief Loss: {update_stats['belief_loss']:.4f}")
                 
                 # 시각화 학습 통계 업데이트
                 viz = get_visualizer()
@@ -1264,6 +1340,21 @@ class PPOTrainer:
                     viz.add_log(f"Update {update_count}: R={rollout_stats['mean_reward']:.2f}")
                     print(f"Policy Loss: {update_stats['policy_loss']:.4f}, "
                                 f"Value Loss: {update_stats['value_loss']:.4f}")
+
+            # Hooks — emit to dashboard / detect NaN / etc.
+            self._call_hooks_update({
+                "update_count":        update_count,
+                "timesteps":           self.timesteps,
+                "episodes":            self.episodes,
+                "mean_reward":         rollout_stats["mean_reward"],
+                "mean_episode_length": rollout_stats.get("mean_length", 0.0),
+                "policy_loss":         update_stats["policy_loss"],
+                "value_loss":          update_stats["value_loss"],
+                "belief_loss":         update_stats["belief_loss"],
+                "entropy":             update_stats["entropy"],
+                "total_loss":          update_stats["total_loss"],
+                "learning_rate":       current_lr,
+            })
             
             # Evaluation
             if update_count % self.config.eval_interval == 0:
@@ -1276,6 +1367,8 @@ class PPOTrainer:
                 if eval_stats['player0_win_rate'] > self.best_win_rate:
                     self.best_win_rate = eval_stats['player0_win_rate']
                     self.save(os.path.join(self.config.save_dir, "best_model.pt"))
+
+                self._call_hooks_eval(eval_stats)
             
             # Save checkpoint
             if update_count % self.config.save_interval == 0:
@@ -1288,6 +1381,7 @@ class PPOTrainer:
         # Final save
         self.save(os.path.join(self.config.save_dir, "latest.pt"))
         print(f"\nTraining complete! Model saved to {self.config.save_dir}/latest.pt")
+        self._call_hooks_end()
         
         # Finetune 모드 최종 통계 저장
         if self.config.finetune:

@@ -73,6 +73,7 @@ REWARD_LOSE: Final[float] = -10.0  # Symmetric loss
 REWARD_GUESS_SUCCESS: Final[float] = 0.5  # Smaller intermediate reward
 REWARD_JOKER_SUCCESS: Final[float] = 1.0  # Slightly higher for joker
 REWARD_GUESS_FAIL: Final[float] = -0.5  # Symmetric failure penalty
+REWARD_GUESS_ORDER_VIOLATION: Final[float] = -0.5  # Extra penalty for guessing outside ordering range
 REWARD_STREAK_BONUS_MULTIPLIER: Final[float] = 0.2  # Smaller streak bonus
 REWARD_STREAK_BREAK: Final[float] = -0.1  # Smaller break penalty
 REWARD_INVALID_ACTION: Final[float] = -1.0  # Still penalize invalid actions
@@ -81,9 +82,19 @@ REWARD_STOP_DECISION: Final[float] = 0.0  # Neutral stop decision
 # Retroactive reward constants (applied after game events)
 REWARD_DRAW_WIN: Final[float] = 0.1      # Draw reward for winning game
 REWARD_DRAW_LOSE: Final[float] = -0.1    # Draw penalty for losing game
-REWARD_CONTINUE_SUCCESS: Final[float] = 0.2   # Continue decision followed by correct guess
-REWARD_CONTINUE_FAIL: Final[float] = -0.2     # Continue decision followed by wrong guess
-REWARD_STOP_WITH_DETERMINED: Final[float] = -0.3  # Stop penalty per determined card not guessed
+REWARD_CONTINUE_SUCCESS: Final[float] = 0.4   # Continue decision followed by correct guess (asymmetric: success > |fail|)
+REWARD_CONTINUE_FAIL: Final[float] = -0.25    # Continue decision followed by wrong guess
+REWARD_STOP_WITH_DETERMINED: Final[float] = -0.5  # Stop penalty per 100%-determined card not guessed
+REWARD_STOP_WITH_NEAR_DETERMINED: Final[float] = -0.15  # Stop penalty per near-determined card (≤2 candidates)
 
 MAX_PLAYERS: Final[int] = 2
+
+# Action space: ordered tuple of action component names.
+# Indices must match the action array layout used throughout training.
+ACTION_KEYS: Final[tuple] = ("color", "position", "value", "decision")
+
+# Default checkpoint paths (relative to the training directory)
+CHECKPOINT_DIR: Final[str] = "checkpoints"
+CHECKPOINT_BEST: Final[str] = "checkpoints/best_model.pt"
+CHECKPOINT_LATEST: Final[str] = "checkpoints/latest.pt"
 
