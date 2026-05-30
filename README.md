@@ -1,222 +1,195 @@
-# Da Vinci Code Self-Play RL Agent
+# Da Vinci Code — Self-Play RL Agent
 
 [![CI](https://github.com/rocknroll17/davinci-code-agent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/rocknroll17/davinci-code-agent/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/rocknroll17/davinci-code-agent/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/rocknroll17/davinci-code-agent/actions/workflows/codeql.yml)
+[![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c.svg?logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A **reinforcement learning self-play agent** for the Da Vinci Code board game.  
-Uses a **Phase-Gated Multi-Head Policy Network** trained via  
-**Adversarial Self-Play** with PPO.
+A reinforcement-learning agent that learns the deduction game **Da Vinci Code** from
+scratch through **PPO self-play** — with a **transformer policy network** that explicitly
+reasons about the opponent's hidden cards (a *belief* auxiliary head).
 
-## About the Game
+### Try it
 
-Da Vinci Code is a deduction-based board game where players try to guess their opponent's tiles.
-- Each player starts with black and white tiles
-- Tiles range from 0–11 plus a Joker (12)
-- Tiles are sorted in ascending order in hand
-- The first player to reveal all opponent tiles wins
+- **[Play against the trained agent in your browser →](https://rocknroll17.github.io/davinci-code-server/)**
+  This same network, exported to ONNX and running 100% client-side — no install.
+  Served by [**davinci-code-server**](https://github.com/rocknroll17/davinci-code-server).
 
-## Project Structure
+<details>
+<summary><b>Table of contents</b></summary>
+
+- [The game](#the-game)
+- [How it works](#how-it-works)
+- [Features](#features)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Reward shaping](#reward-shaping)
+- [Observation & action spaces](#observation--action-spaces)
+- [PPO hyperparameters](#ppo-hyperparameters)
+- [Repository layout](#repository-layout)
+- [Docker](#docker)
+- [License](#license)
+
+</details>
+
+## The game
+
+Da Vinci Code is a deduction board game: you guess your opponent's hidden number tiles
+before they guess yours.
+
+- Tiles are black or white, valued **0–11** plus a **Joker (12)**.
+- Each hand is kept **sorted ascending** (ties: black before white) — leaking ordering info.
+- Guess right → the tile flips face-up and you may keep guessing; guess wrong → one of
+  **your** tiles flips up. First to reveal all of the opponent's tiles **wins**.
+
+## How it works
+
+A **single policy network plays both seats** (adversarial self-play) and is optimized with
+**PPO**. One game step is one of three phases — **DRAW**, **GUESS**, **DECISION** — and the
+network routes to the matching action head (*phase gating*).
 
 ```
-davinci-agent/
-├── main.py                 # Training entry point
-├── eval.py                 # Model evaluation (win rate measurement)
-├── play.py                 # Watch model play (Rich visualization)
-├── requirements.txt        # Training dependencies
-├── src/
-│   ├── constants.py        # Constants and enums
-│   ├── env.py              # Gymnasium Environment
-│   ├── model.py            # Phase-Gated Policy Network
-│   ├── buffer.py           # Rollout Buffer (GAE)
-│   ├── trainer.py          # PPO Trainer
-│   ├── deck.py             # Deck management
-│   ├── hand.py             # Hand management
-│   ├── player.py           # Player class
-│   ├── phase.py            # Phase management
-│   ├── vec_env.py          # Vectorized environment (parallel training)
-│   ├── visualizer.py       # Rich-based training visualizer
-│   ├── cards/
-│   │   ├── card.py         # Base Card class
-│   │   ├── black_card.py   # Black card
-│   │   └── white_card.py   # White card
-│   ├── result/
-│   │   ├── result.py       # Base Result class
-│   │   ├── guess_result.py # Guess result
-│   │   ├── draw_result.py  # Draw result
-│   │   └── streak_result.py# Streak result
-│   ├── utils/
-│   │   ├── game_logic.py   # Game logic utilities
-│   │   ├── logger.py       # Logging configuration
-│   │   └── utils.py        # General utilities
-│   ├── docs/
-│   │   └── model.md        # Model I/O design specification
-│   └── tools/
-│       └── validate.py     # Hand validation debug tool
-├── checkpoints/            # Model checkpoints
-└── logs/                   # Training logs (JSON)
+Observation (hands, deck, constraints, phase)
+      │
+      ▼
+Transformer encoder  ──►  CLS = global state   ─┐
+(42 tokens, self-attention)   per-slot opponent ─┤
+      │                                          │
+      ▼                                          ▼
+Belief module  ── predicts each hidden           Phase-gated heads
+opponent tile's value distribution (aux loss),   ├─ DRAW    → color
+fed back into the opponent representation        ├─ GUESS   → position → value (autoregressive)
+                                                 └─ DECISION→ stop / continue
+                                          + Value head V(s) for the PPO critic
 ```
 
-## Setup
+The **belief module** is the core idea: a self-supervised auxiliary task predicts the
+opponent's hidden values; its gradient shapes the encoder toward representations that are
+good for *deduction*, and its (detached) prediction enriches the per-slot features the
+GUESS head attends to.
 
-### 1. Create and activate virtual environment
+> **Full I/O spec, tokenization, and the belief→action pipeline:** see
+> [`src/docs/model.md`](src/docs/model.md).
+
+## Features
+
+- **PPO self-play** — one network learns offense and defense simultaneously.
+- **Transformer policy** with a learnable CLS token and constraint-as-token encoding.
+- **Belief auxiliary head** — explicit opponent-card-value prediction (CrossEntropy aux loss).
+- **Phase-gated multi-head** action space with legal-move masking.
+- **Vectorized self-play** (`src/vec_env.py`) for fast rollout collection.
+- **Training hooks** (`src/hooks.py`) — NaN/loss-spike/action-diversity monitors, auto-checkpointing.
+- **Live dashboard** (`src/dashboard/`) and a Rich TUI visualizer for monitoring runs.
+- **Resumable checkpoints**, fine-tune mode, and an evaluation suite.
+
+## Install
+
+Requires **Python 3.10** and (for training) a CUDA-capable GPU.
+
 ```bash
-python3.10 -m venv venv
-source venv/bin/activate
-```
-
-### 2. Install dependencies
-```bash
+python3.10 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Training
+## Quick start
+
 ```bash
-# Default training (with Rich visualization)
+# Train (auto-resumes from checkpoints/latest.pt). Rich visualization by default.
 python main.py
+python main.py --no-viz            # headless (servers/CI)
+python main.py --dashboard         # browser dashboard on :6006
+python main.py --finetune          # edge-case fine-tuning mode
 
-# Training without visualization
-python main.py --no-viz
-
-# Fine-tuning mode (edge case training)
-python main.py --finetune
-
-# Reset optimizer (when switching from fine-tuning to normal training)
-python main.py --reset-optimizer
-```
-
-Training automatically resumes from `checkpoints/latest.pt` if it exists.
-
-### 4. Evaluation
-```bash
-# Default evaluation (200 games)
-python eval.py
-
-# Custom options
+# Evaluate a checkpoint's win rate
 python eval.py --checkpoint checkpoints/best_model.pt --episodes 500 --device cuda
-```
 
-### 5. Watch Model Play
-```bash
-# Step-by-step (press Enter each step)
-python play.py
-
-# Auto-play
+# Watch the model play (Rich)
 python play.py --auto --delay 0.5
-
-# Multiple episodes
 python play.py --episodes 5 --deterministic
 ```
 
-## Model Architecture
+## Reward shaping
 
-### Phase-Gated Multi-Head Policy Network
-
-```
-Observation → Encoder → Features
-                           ↓
-                    ┌──────┴──────┐
-                    │   Phase     │
-                    │   Gating    │
-                    └──────┬──────┘
-         ┌─────────────────┼─────────────────┐
-         ↓                 ↓                 ↓
-    Color Head      Position/Value      Decision Head
-    (DRAW Phase)    (GUESS Phase)      (DECISION Phase)
-```
-
-- **Observation Encoder**: Converts dict observation into a unified feature vector
-- **Phase Gating**: Activates only the head corresponding to the current phase
-- **Value Head**: State value estimation for Actor-Critic training
-
-### Observation Space
-
-| Key | Shape | Description |
-|-----|-------|-------------|
-| `phase` | (3,) | One-hot: [DRAW, GUESS, DECISION] |
-| `my_hand` | (13, 2) | My hand: [color, value] × 13 |
-| `opponent_hand` | (13, 2) | Opponent hand (hidden cards = -1) |
-| `remaining_deck` | (2,) | [black, white] remaining count |
-| `constraint_matrix` | (13, 13) | Failed guess history |
-
-### Action Space
-
-| Head | Size | Phase | Description |
-|------|------|-------|-------------|
-| color | 2 | DRAW | BLACK(0) / WHITE(1) |
-| position | 13 | GUESS | Opponent hand position (0-12) |
-| value | 13 | GUESS | Guessed value (0-12) |
-| decision | 2 | DECISION | STOP(0) / CONTINUE(1) |
-
-## Reward Structure
+Outcome-dominated, with small shaping terms (exact values in [`src/constants.py`](src/constants.py)):
 
 | Event | Reward |
 |-------|--------|
-| Win | +10.0 |
-| Lose | -10.0 |
-| Correct guess | +0.5 |
-| Correct joker guess | +1.0 |
-| Wrong guess | -0.5 |
-| Streak bonus | +(0.2 × streak) |
-| Streak break | -0.1 |
-| Invalid action | -1.0 |
-| Stop decision | 0.0 |
-| Draw (winning game) | +0.1 |
-| Draw (losing game) | -0.1 |
-| Continue → correct | +0.2 |
-| Continue → wrong | -0.2 |
-| Stop with determined cards | -0.3 per card |
+| Win / Lose | **+10.0** / **−10.0** |
+| Correct guess (normal / Joker) | +0.5 / +1.0 |
+| Wrong guess | −0.5 |
+| Guess outside the sort-order range | −0.5 |
+| Streak bonus / break | +0.2 × streak / −0.1 |
+| Invalid action | −1.0 |
+| Continue → correct / wrong | +0.4 / −0.25 |
+| Stop while a card is fully / nearly determined | −0.5 / −0.15 per card |
+| Draw in a winning / losing game | +0.1 / −0.1 |
 
-## PPO Hyperparameters
+## Observation & action spaces
 
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| learning_rate | 0.5e-5 | Learning rate |
-| n_envs | 1000 | Parallel environments |
-| episodes_per_update | 1000 | Episodes per update |
-| batch_size | 2048 | Mini-batch size |
-| n_epochs | 8 | PPO epochs |
-| gamma | 0.99 | Discount factor |
-| gae_lambda | 0.95 | GAE lambda |
-| clip_range | 0.07 | PPO clip range |
-| ent_coef | 0.002 | Entropy coefficient |
-| color_ent_coef | 0.05 | Color head entropy coefficient |
-| vf_coef | 0.5 | Value function coefficient |
+**Observation** (dict):
 
-## Self-Play
+| Key | Shape | Description |
+|-----|-------|-------------|
+| `phase` | (3,) | one-hot [DRAW, GUESS, DECISION] |
+| `my_hand` | (13, 2) | my tiles `[color, value]` |
+| `opponent_hand` | (13, 2) | opponent tiles (hidden value = −1) |
+| `remaining_deck` | (2,) | remaining [black, white] |
+| `constraint_matrix` | (13, 13) | per-slot ruled-out values (rule-derived) |
 
-A single policy network controls both players:
+**Actions** (phase-gated heads):
 
-```python
-while not done:
-    action = policy.get_action(obs, action_mask)
-    obs, reward, done, info = env.step(action)
-    buffer.add(transition)
+| Head | Size | Phase | Meaning |
+|------|------|-------|---------|
+| color | 2 | DRAW | BLACK / WHITE |
+| position | 13 | GUESS | which opponent slot to attack |
+| value | 13 | GUESS | guessed value (conditioned on position) |
+| decision | 2 | DECISION | STOP / CONTINUE |
+
+## PPO hyperparameters
+
+Defaults from `PPOConfig` in [`src/trainer.py`](src/trainer.py) (override via `src/experiment_config.py`):
+
+| Parameter | Value | | Parameter | Value |
+|-----------|-------|-|-----------|-------|
+| learning_rate | 8e-5 → 3e-5 | | clip_range | 0.2 |
+| n_envs | 300 | | clip_range_vf | 10.0 |
+| episodes_per_update | 300 | | ent_coef | 0.01 |
+| batch_size | 1096 | | color_ent_coef | 0.02 |
+| n_epochs | 8 | | vf_coef | 0.5 |
+| gamma / gae_lambda | 0.99 / 0.95 | | belief_coef | 0.2 |
+| hidden_dim | 512 | | max_grad_norm | 0.5 |
+
+## Repository layout
+
 ```
-
-This approach enables:
-- Simultaneous learning of offense and defense
-- Self-identification and correction of weaknesses
-- Gradual convergence toward stronger strategies
+main.py            Training entry point (--no-viz / --finetune / --dashboard)
+eval.py            Win-rate evaluation
+play.py            Watch the model play (Rich)
+src/
+  model.py         Transformer policy + belief module + phase-gated heads
+  trainer.py       PPO trainer (GAE, losses, hooks)
+  env.py           Gymnasium environment   vec_env.py  Vectorized self-play
+  buffer.py        Rollout buffer          agent.py    Inference wrapper
+  hooks.py         Training monitors       eval_suite.py / trajectory.py / builders.py
+  experiment_config.py                     visualizer.py  Rich TUI
+  dashboard/       Live web dashboard      docs/model.md  Model spec
+  deck.py hand.py player.py phase.py constants.py  cards/  result/  utils/
+checkpoints/       Saved models (gitignored)    logs/  Training logs
+```
 
 ## Docker
 
-Build a reproducible training image locally (no image is published — training
-is not a deployed service):
+A reproducible training image (no image is published — training isn't a deployed service):
 
 ```bash
 docker build -t davinci-agent .
-
-# Train on GPU. Mount host dirs so checkpoints/logs survive the container.
 docker run --rm --gpus all \
     -v "$(pwd)/checkpoints:/app/checkpoints" \
     -v "$(pwd)/logs:/app/logs" \
-    davinci-agent
+    davinci-agent            # runs `python main.py --no-viz`
 ```
-
-Training resumes automatically from `checkpoints/latest.pt` if present. Override
-any setting via env vars or args, e.g. `... davinci-agent python main.py --finetune`.
 
 ## License
 
-MIT License
+[MIT](LICENSE)
