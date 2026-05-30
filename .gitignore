@@ -37,3 +37,7 @@ logs/
 
 # Runtime artifacts
 game_winners.log
+
+# Analysis tools / artifacts — kept local, not part of the training package
+/analyze_model.py
+/analysis_results*.json
