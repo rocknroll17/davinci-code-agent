@@ -1,0 +1,381 @@
+"""
+EvalSuite — deep evaluation metrics for DaVinci Code policy.
+
+Usage
+-----
+Single-model eval
+~~~~~~~~~~~~~~~~~
+from src.eval_suite import EvalSuite
+
+report = EvalSuite.run(trainer, n_episodes=200)
+print(report)
+
+Compare two checkpoints
+~~~~~~~~~~~~~~~~~~~~~~~
+from src.agent import ModelAgent
+from src.eval_suite import EvalSuite
+
+a = ModelAgent.from_checkpoint("checkpoints/before.pt")
+b = ModelAgent.from_checkpoint("checkpoints/after.pt")
+r_a = EvalSuite.run_agent(a, n_episodes=200)
+r_b = EvalSuite.run_agent(b, n_episodes=200)
+print(r_b.compare(r_a))
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+import numpy as np
+import torch
+
+from src.env import DaVinciCodeEnv
+from src.model import DaVinciCodePolicy, obs_to_tensor, action_mask_to_tensor
+from src.constants import CardValue, Phase, MAX_HAND_SIZE
+
+
+# ---------------------------------------------------------------------------
+# EvalReport
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EvalReport:
+    """Rich evaluation metrics for a single policy."""
+
+    n_episodes: int = 0
+
+    # ── win rates ──
+    player0_wins: int = 0
+    player1_wins: int = 0
+    draws: int = 0
+
+    # ── episode length ──
+    episode_lengths: List[int] = field(default_factory=list)
+
+    # ── rewards ──
+    episode_rewards_p0: List[float] = field(default_factory=list)
+    episode_rewards_p1: List[float] = field(default_factory=list)
+
+    # ── guess accuracy ──
+    guess_total: int = 0
+    guess_correct: int = 0
+    joker_guess_total: int = 0
+    joker_guess_correct: int = 0
+
+    # per-value[0-12] and per-position[0-12] accumulators
+    guess_correct_by_value: List[int] = field(default_factory=lambda: [0] * 13)
+    guess_total_by_value: List[int] = field(default_factory=lambda: [0] * 13)
+    guess_correct_by_pos: List[int] = field(default_factory=lambda: [0] * 13)
+    guess_total_by_pos: List[int] = field(default_factory=lambda: [0] * 13)
+
+    # ── invalid actions ──
+    invalid_action_count: int = 0
+    total_steps: int = 0
+
+    # ── streak ──
+    streak_lengths: List[int] = field(default_factory=list)  # per-episode max streak
+
+    # ── action distributions ──
+    color_dist: List[int] = field(default_factory=lambda: [0, 0])         # [BLACK, WHITE]
+    value_dist: List[int] = field(default_factory=lambda: [0] * 13)       # 0-12
+    decision_dist: List[int] = field(default_factory=lambda: [0, 0])      # [STOP, CONTINUE]
+    position_dist: List[int] = field(default_factory=lambda: [0] * 13)    # 0-12
+
+    # ── belief accuracy (optional) ──
+    belief_total_positions: int = 0
+    belief_correct_positions: int = 0
+
+    # ── metadata ──
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    # ------------------------------------------------------------------
+    # Derived properties
+    # ------------------------------------------------------------------
+
+    @property
+    def win_rate_p0(self) -> float:
+        return self.player0_wins / self.n_episodes if self.n_episodes else 0.0
+
+    @property
+    def win_rate_p1(self) -> float:
+        return self.player1_wins / self.n_episodes if self.n_episodes else 0.0
+
+    @property
+    def draw_rate(self) -> float:
+        return self.draws / self.n_episodes if self.n_episodes else 0.0
+
+    @property
+    def mean_episode_length(self) -> float:
+        return float(np.mean(self.episode_lengths)) if self.episode_lengths else 0.0
+
+    @property
+    def mean_reward_p0(self) -> float:
+        return float(np.mean(self.episode_rewards_p0)) if self.episode_rewards_p0 else 0.0
+
+    @property
+    def mean_reward_p1(self) -> float:
+        return float(np.mean(self.episode_rewards_p1)) if self.episode_rewards_p1 else 0.0
+
+    @property
+    def guess_accuracy(self) -> float:
+        return self.guess_correct / self.guess_total if self.guess_total else 0.0
+
+    @property
+    def joker_accuracy(self) -> float:
+        return (self.joker_guess_correct / self.joker_guess_total
+                if self.joker_guess_total else 0.0)
+
+    @property
+    def invalid_action_rate(self) -> float:
+        return self.invalid_action_count / self.total_steps if self.total_steps else 0.0
+
+    @property
+    def mean_streak_length(self) -> float:
+        return float(np.mean(self.streak_lengths)) if self.streak_lengths else 0.0
+
+    @property
+    def belief_accuracy(self) -> Optional[float]:
+        if self.belief_total_positions == 0:
+            return None
+        return self.belief_correct_positions / self.belief_total_positions
+
+    @property
+    def accuracy_by_value(self) -> Dict[int, float]:
+        out = {}
+        for v in range(13):
+            t = self.guess_total_by_value[v]
+            out[v] = self.guess_correct_by_value[v] / t if t > 0 else None
+        return out
+
+    @property
+    def accuracy_by_position(self) -> Dict[int, float]:
+        out = {}
+        for p in range(13):
+            t = self.guess_total_by_pos[p]
+            out[p] = self.guess_correct_by_pos[p] / t if t > 0 else None
+        return out
+
+    # ------------------------------------------------------------------
+    # Comparison
+    # ------------------------------------------------------------------
+
+    def compare(self, baseline: "EvalReport") -> Dict[str, Any]:
+        """Return a dictionary of deltas vs *baseline* (self - baseline)."""
+        def _delta(a, b):
+            if a is None or b is None:
+                return None
+            return round(a - b, 4)
+
+        return {
+            "win_rate_p0":         _delta(self.win_rate_p0,         baseline.win_rate_p0),
+            "win_rate_p1":         _delta(self.win_rate_p1,         baseline.win_rate_p1),
+            "mean_episode_length": _delta(self.mean_episode_length, baseline.mean_episode_length),
+            "mean_reward_p0":      _delta(self.mean_reward_p0,      baseline.mean_reward_p0),
+            "guess_accuracy":      _delta(self.guess_accuracy,      baseline.guess_accuracy),
+            "joker_accuracy":      _delta(self.joker_accuracy,      baseline.joker_accuracy),
+            "invalid_action_rate": _delta(self.invalid_action_rate, baseline.invalid_action_rate),
+            "mean_streak_length":  _delta(self.mean_streak_length,  baseline.mean_streak_length),
+            "belief_accuracy":     _delta(self.belief_accuracy,     baseline.belief_accuracy),
+        }
+
+    def to_dict(self) -> dict:
+        return {
+            "n_episodes":           self.n_episodes,
+            "win_rate_p0":          self.win_rate_p0,
+            "win_rate_p1":          self.win_rate_p1,
+            "draw_rate":            self.draw_rate,
+            "mean_episode_length":  self.mean_episode_length,
+            "mean_reward_p0":       self.mean_reward_p0,
+            "mean_reward_p1":       self.mean_reward_p1,
+            "guess_accuracy":       self.guess_accuracy,
+            "joker_accuracy":       self.joker_accuracy,
+            "accuracy_by_value":    {str(k): v for k, v in self.accuracy_by_value.items() if v is not None},
+            "accuracy_by_position": {str(k): v for k, v in self.accuracy_by_position.items() if v is not None},
+            "invalid_action_rate":  self.invalid_action_rate,
+            "mean_streak_length":   self.mean_streak_length,
+            "belief_accuracy":      self.belief_accuracy,
+            "color_dist":           self.color_dist,
+            "value_dist":           self.value_dist,
+            "decision_dist":        self.decision_dist,
+            "position_dist":        self.position_dist,
+        }
+
+    def __str__(self) -> str:
+        ba = f"{self.belief_accuracy:.3f}" if self.belief_accuracy is not None else "N/A"
+        return (
+            f"EvalReport ({self.n_episodes} episodes)\n"
+            f"  Win rates  — P0: {self.win_rate_p0:.1%}  P1: {self.win_rate_p1:.1%}  Draw: {self.draw_rate:.1%}\n"
+            f"  Rewards    — P0: {self.mean_reward_p0:+.3f}  P1: {self.mean_reward_p1:+.3f}\n"
+            f"  Length     — mean {self.mean_episode_length:.1f} steps\n"
+            f"  Guess      — overall {self.guess_accuracy:.1%}  joker {self.joker_accuracy:.1%}"
+            f"  ({self.guess_correct}/{self.guess_total})\n"
+            f"  Streak     — mean {self.mean_streak_length:.2f}\n"
+            f"  Belief acc — {ba}\n"
+            f"  Invalid    — {self.invalid_action_rate:.2%}\n"
+        )
+
+
+# ---------------------------------------------------------------------------
+# EvalSuite
+# ---------------------------------------------------------------------------
+
+class EvalSuite:
+    """
+    Runs deep evaluation and returns a rich ``EvalReport``.
+
+    Class methods
+    -------------
+    run(trainer, n_episodes, seed)
+        Evaluate a live ``PPOTrainer`` (uses its existing ``.env`` + policy).
+    run_agent(agent, n_episodes, device, seed)
+        Evaluate a ``ModelAgent`` using a fresh env.
+    run_policy(policy, device, n_episodes, seed)
+        Low-level: evaluate any ``DaVinciCodePolicy`` directly.
+    """
+
+    # ------------------------------------------------------------------
+    # High-level entry points
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def run(cls, trainer, n_episodes: int = 200, seed: Optional[int] = None) -> EvalReport:
+        """Evaluate a live ``PPOTrainer``."""
+        return cls.run_policy(trainer.policy, trainer.device,
+                              n_episodes=n_episodes, seed=seed)
+
+    @classmethod
+    def run_agent(
+        cls,
+        agent,                          # ModelAgent
+        n_episodes: int = 200,
+        device: Optional[torch.device] = None,
+        seed: Optional[int] = None,
+    ) -> EvalReport:
+        """Evaluate a ``ModelAgent``."""
+        dev = device or agent.device
+        return cls.run_policy(agent.policy, dev,
+                              n_episodes=n_episodes, seed=seed)
+
+    # ------------------------------------------------------------------
+    # Core implementation
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def run_policy(
+        cls,
+        policy: DaVinciCodePolicy,
+        device: torch.device,
+        n_episodes: int = 200,
+        seed: Optional[int] = None,
+    ) -> EvalReport:
+        """Run full evaluation and return an ``EvalReport``."""
+        env = DaVinciCodeEnv(seed=seed)
+        report = EvalReport(n_episodes=n_episodes)
+
+        policy.eval()
+        with torch.no_grad():
+            for ep in range(n_episodes):
+                ep_seed = (seed + ep) if seed is not None else None
+                obs, info = env.reset(seed=ep_seed)
+                done = False
+                ep_rewards = [0.0, 0.0]
+                ep_length = 0
+                ep_max_streak = 0
+
+                while not done:
+                    current_player = info.get("current_player", 0)
+                    action_mask = env.get_action_mask()
+                    phase_idx = int(np.argmax(obs["phase"]))
+
+                    obs_t = obs_to_tensor(obs, device)
+                    mask_t = action_mask_to_tensor(action_mask, device)
+
+                    action, _lp, _v = policy.get_action(obs_t, mask_t, deterministic=True)
+                    action_np = action[0]   # scalar array shape (4,)
+
+                    # ── belief accuracy: compare prediction vs actual hidden values ──
+                    hidden_vals = info.get("hidden_values")
+                    if hidden_vals is not None:
+                        # Run encoder + belief head
+                        feats, _cp, opp_per_pos = policy.encoder(obs_t)
+                        global_exp = feats.unsqueeze(1).expand(-1, MAX_HAND_SIZE, -1)
+                        combined = torch.cat([global_exp, opp_per_pos], dim=-1)
+                        belief_logits = policy.belief_head(combined)  # (1, 13, 13)
+                        predicted = belief_logits[0].argmax(dim=-1).cpu().numpy()  # (13,)
+                        hidden_np = np.asarray(hidden_vals, dtype=np.int8)
+                        visible_mask = hidden_np >= 0
+                        if visible_mask.any():
+                            report.belief_total_positions  += int(visible_mask.sum())
+                            report.belief_correct_positions += int(
+                                (predicted[visible_mask] == hidden_np[visible_mask]).sum()
+                            )
+
+                    next_obs, _, reward, terminated, truncated, next_info, result = env.step(action_np)
+                    done = terminated or truncated
+
+                    # ── collect per-step stats ──
+                    report.total_steps += 1
+                    ep_rewards[current_player] += float(reward)
+                    ep_length += 1
+
+                    # action distributions
+                    color, pos, val, dec = int(action_np[0]), int(action_np[1]), int(action_np[2]), int(action_np[3])
+                    if phase_idx == Phase.DRAW.value:
+                        report.color_dist[color] += 1
+                    elif phase_idx == Phase.GUESS.value:
+                        report.position_dist[min(pos, 12)] += 1
+                        report.value_dist[min(val, 12)] += 1
+                    elif phase_idx == Phase.DECISION.value:
+                        report.decision_dist[dec] += 1
+
+                    # validity
+                    if result is not None and hasattr(result, "is_invalid") and result.is_invalid:
+                        report.invalid_action_count += 1
+
+                    # guess accuracy
+                    if phase_idx == Phase.GUESS.value and result is not None and hasattr(result, "is_correct"):
+                        if not result.is_invalid:
+                            report.guess_total += 1
+                            correct = bool(result.is_correct)
+                            if correct:
+                                report.guess_correct += 1
+                            # by target value
+                            target_v = min(int(action_np[2]), 12)
+                            report.guess_total_by_value[target_v] += 1
+                            if correct:
+                                report.guess_correct_by_value[target_v] += 1
+                            # by target position
+                            target_p = min(int(action_np[1]), 12)
+                            report.guess_total_by_pos[target_p] += 1
+                            if correct:
+                                report.guess_correct_by_pos[target_p] += 1
+                            # joker guesses
+                            if val == CardValue.JOKER:
+                                report.joker_guess_total += 1
+                                if correct:
+                                    report.joker_guess_correct += 1
+
+                    # streak
+                    streak = getattr(env, "_streak", 0)
+                    if streak > ep_max_streak:
+                        ep_max_streak = streak
+
+                    obs, info = next_obs, next_info
+
+                # ── end of episode ──
+                winner = next_info.get("winner")
+                if winner == 0:
+                    report.player0_wins += 1
+                elif winner == 1:
+                    report.player1_wins += 1
+                else:
+                    report.draws += 1
+
+                report.episode_lengths.append(ep_length)
+                report.episode_rewards_p0.append(ep_rewards[0])
+                report.episode_rewards_p1.append(ep_rewards[1])
+                report.streak_lengths.append(ep_max_streak)
+
+        policy.train()
+        env.close()
+        return report

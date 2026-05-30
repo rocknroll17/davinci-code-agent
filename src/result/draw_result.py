@@ -5,9 +5,8 @@ class DrawResult(Result):
     """Class representing a draw result in a game."""
     def __init__(self, player_id: int, reward: float, drawn_card: Card, position: int, is_invalid: bool = False) -> None:
         super().__init__(player_id, reward, is_invalid)
-        if not is_invalid:
-            self.drawn_card = drawn_card
-            self.position = position
+        self.drawn_card: Card | None = drawn_card if not is_invalid else None
+        self.position: int | None = position if not is_invalid else None
 
     def __repr__(self) -> str:
         return str(self)

@@ -1,5 +1,9 @@
 # Da Vinci Code Self-Play RL Agent
 
+[![CI](https://github.com/rocknroll17/davinci-code-agent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/rocknroll17/davinci-code-agent/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/rocknroll17/davinci-code-agent/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/rocknroll17/davinci-code-agent/actions/workflows/codeql.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A **reinforcement learning self-play agent** for the Da Vinci Code board game.  
 Uses a **Phase-Gated Multi-Head Policy Network** trained via  
 **Adversarial Self-Play** with PPO.
@@ -194,6 +198,24 @@ This approach enables:
 - Simultaneous learning of offense and defense
 - Self-identification and correction of weaknesses
 - Gradual convergence toward stronger strategies
+
+## Docker
+
+Build a reproducible training image locally (no image is published — training
+is not a deployed service):
+
+```bash
+docker build -t davinci-agent .
+
+# Train on GPU. Mount host dirs so checkpoints/logs survive the container.
+docker run --rm --gpus all \
+    -v "$(pwd)/checkpoints:/app/checkpoints" \
+    -v "$(pwd)/logs:/app/logs" \
+    davinci-agent
+```
+
+Training resumes automatically from `checkpoints/latest.pt` if present. Override
+any setting via env vars or args, e.g. `... davinci-agent python main.py --finetune`.
 
 ## License
 

@@ -1,14 +1,22 @@
-import sys
 import numpy as np
-from src.constants import MAX_HAND_SIZE, NUM_VALUES
+from src.constants import MAX_HAND_SIZE, NUM_VALUES, Color
 from src.hand import Hand
+
+
+# Constraint matrix cell values
+_SLOT_EMPTY    = -1  # slot does not exist (opponent has no card here)
+_VALUE_UNKNOWN =  0  # slot exists, value not yet ruled out or confirmed
+_VALUE_RULED_OUT = 1  # slot exists, this value has been tried and failed (or card is revealed)
 
 
 class Player:
     def __init__(self, player_id: int):
         self.player_id = player_id
         self._hand: Hand = Hand()
-        self._constraint_matrix: np.ndarray = np.zeros((MAX_HAND_SIZE, NUM_VALUES), dtype=np.int8)
+        # shape (MAX_HAND_SIZE, NUM_VALUES): _SLOT_EMPTY → _VALUE_UNKNOWN → _VALUE_RULED_OUT
+        self._constraint_matrix: np.ndarray = np.full(
+            (MAX_HAND_SIZE, NUM_VALUES), _SLOT_EMPTY, dtype=np.int8
+        )
 
     def __repr__(self) -> str:
         return f"Player({self.player_id})"
@@ -18,7 +26,7 @@ class Player:
     
     def reset(self) -> None:
         self._hand.clear()
-        self._constraint_matrix.fill(-1)
+        self._constraint_matrix.fill(_SLOT_EMPTY)
         
 
     def _update_constraint_revealed(self, position: int) -> None:
@@ -29,36 +37,34 @@ class Player:
             position: Position of revealed card
             value: Value of revealed card
         """
-        # Mark the entire row as known (set to 1)
-        self._constraint_matrix[position, :] = 1
+        # Mark entire row as ruled-out: card is revealed, its exact value is now known
+        self._constraint_matrix[position, :] = _VALUE_RULED_OUT
     
-    def _update_constraint_failed(self, position: int, value: int) -> None:
+    def _update_constraint_failed(self, position: int, value: int, color: Color) -> None:
         """
         Update constraint matrix when guess fails.
         
         Args:
             position: Position that was guessed
             value: Value that was wrong
+            color: Color of the card at that position (known, visible)
         """
-        self._constraint_matrix[position, value] = 1
+        # Column index = value (slot color is already visible via opp_hand)
+        col = value
+        self._constraint_matrix[position, col] = _VALUE_RULED_OUT
 
-    def _get_observation(self, is_mine: bool) -> dict[str, np.ndarray]:
-        """
-        Get current observation from this player's perspective.
-        
-        Returns:
-            Observation dictionary
-        """
-        if is_mine:
-            return {
-                "my_hand": self._hand.to_observation(hidden=False),
-                "constraint_matrix": self._constraint_matrix.copy()
-            }
+    def get_own_observation(self) -> dict[str, np.ndarray]:
+        """Get observation from this player's own perspective (full hand + constraint matrix)."""
+        return {
+            "my_hand": self._hand.to_observation(hidden=False),
+            "constraint_matrix": self._constraint_matrix.copy()
+        }
 
-        else:
-            return {
-                "opponent_hand": self._hand.to_observation(hidden=True)
-            }
+    def get_opponent_observation(self) -> dict[str, np.ndarray]:
+        """Get observation of this player as seen by the opponent (hidden hand)."""
+        return {
+            "opponent_hand": self._hand.to_observation(hidden=True)
+        }
     
     
     def end_turn(self) -> None:
@@ -69,16 +75,17 @@ class Player:
     def guess_success(self, position: int) -> None:
         self._update_constraint_revealed(position)
 
-    def guess_fail(self, position: int, guessed_value: int) -> None:
+    def guess_fail(self, position: int, guessed_value: int, color: Color) -> None:
         """
         Handle actions when a guess fails.
         
         Args:
             position: Position that was guessed
             guessed_value: Value that was incorrectly guessed
+            color: Color of the card at that position (visible to guesser)
         """
-        # Update constraint matrix - mark this value as wrong for this position
-        self._update_constraint_failed(position, guessed_value)
+        # Update constraint matrix - mark this (color, value) as wrong for this position
+        self._update_constraint_failed(position, guessed_value, color)
         
         # Reveal own card (the one just drawn)
         return self._hand.reveal_drawn_card()
@@ -90,24 +97,15 @@ class Player:
         Args:
             position: Position of the drawn card
         """
-        # Insert an unknown row at `position`, shifting subsequent rows to the
-        # right. Keep the matrix length constant by dropping the last row.
+        # Insert a fresh _VALUE_UNKNOWN row at `position`; drop the last row to keep shape constant
         nrows, ncols = self._constraint_matrix.shape
-        # Clamp position
-        if position < 0:
-            position = 0
-        if position > nrows:
-            position = nrows
-
-        # Use numpy.insert to insert a zero row, then truncate to original size
+        position = max(0, min(position, nrows))
         self._constraint_matrix = np.insert(
             self._constraint_matrix,
             position,
             values=np.zeros(ncols, dtype=self._constraint_matrix.dtype),
             axis=0
         )
-
-        # Truncate if grew by one
         if self._constraint_matrix.shape[0] > nrows:
             self._constraint_matrix = self._constraint_matrix[:nrows, :]
 
@@ -117,4 +115,4 @@ class Player:
         
         Marks all positions as unknown (0) for the initial hand size.
         """
-        self._constraint_matrix[:initial_hand_size, :] = 0
+        self._constraint_matrix[:initial_hand_size, :] = _VALUE_UNKNOWN
