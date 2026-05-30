@@ -3,6 +3,7 @@
 Exercises env + model forward + belief module + GAE + backward in a single
 update. No checkpoint or GPU required, so it runs on a stock CI runner.
 """
+import math
 import os
 import sys
 
@@ -32,7 +33,7 @@ def main() -> None:
     stats = trainer.update()
 
     total = stats["total_loss"]
-    assert total == total, "total_loss is NaN"  # NaN != NaN
+    assert not math.isnan(total), "total_loss is NaN"
     print(
         f"[smoke] one PPO update OK — "
         f"total_loss={total:.4f}, belief_loss={stats.get('belief_loss')}"
