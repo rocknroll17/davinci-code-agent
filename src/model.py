@@ -561,10 +561,16 @@ class DaVinciCodePolicy(nn.Module):
         """
         Compute belief predictions and inject into opponent features as a residual.
 
-        CE loss gradient flows through belief_head -> encoder (no detach on belief_logits).
-        belief_probs are detached before being passed to action heads so RL gradient
-        cannot back-propagate through belief_head — avoids the gradient conflict that
-        caused the original belief-action connection to fail.
+        Gradient routing (the belief CE loss is applied to belief_logits elsewhere):
+          - The global `features` input is DETACHED, so the CE gradient does NOT flow
+            into the encoder through the global-context path.
+          - `opponent_per_pos` is NOT detached, so the CE gradient DOES reach the encoder,
+            but only through the per-slot opponent features (a deliberate "half-detach").
+          This shapes the per-slot representations for belief while shielding the global
+          features (which value_head depends on) from the competing belief signal.
+
+        belief_probs are detached before being passed to action heads so the RL
+        (policy/value) gradient cannot back-propagate through belief_head.
 
         belief_to_opp_proj is zero-initialized: enrichment starts at 0 and grows
         naturally as belief quality improves. This preserves loaded checkpoint behaviour.
@@ -573,16 +579,17 @@ class DaVinciCodePolicy(nn.Module):
             enriched_opp:  (batch, 13, 64) — same shape as opponent_per_pos
             belief_logits: (batch, 13, 13) — raw logits for CE auxiliary loss
         """
-        # Detach features before belief_head: belief CE gradient must NOT reach the encoder.
-        # encoder is shared by value_head and belief_head; competing gradients from
-        # the two objectives (game outcome vs. card distribution) push features in
-        # conflicting directions, causing value_loss to inflate.
+        # Detach the GLOBAL features before belief_head: the belief CE gradient must not
+        # reach the encoder through the global-context path. The global features are shared
+        # with value_head; competing gradients (game outcome vs. card distribution) would
+        # push them in conflicting directions and inflate value_loss.
         # Detaching here lets belief still USE global context in the forward pass
-        # (prediction quality unchanged) while fully protecting the encoder.
+        # (prediction quality unchanged) while protecting the global features.
         global_exp = features.detach().unsqueeze(1).expand(-1, MAX_HAND_SIZE, -1)
-        # Combine with per-position features: (batch, 13, hidden_dim+64)
+        # Combine with per-position features (NOT detached): (batch, 13, hidden_dim+64)
         combined = torch.cat([global_exp, opponent_per_pos], dim=-1)
-        # Belief logits — gradient flows through belief_head only (not into encoder)
+        # Belief logits. CE gradient flows through belief_head AND into the encoder via
+        # opponent_per_pos only (the global path above is detached) — a deliberate half-detach.
         belief_logits = self.belief_head(combined)          # (batch, 13, 13)
         # Detach before action heads: RL signal must not contaminate belief head
         belief_probs = belief_logits.detach().softmax(dim=-1)  # (batch, 13, 13)
