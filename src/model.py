@@ -28,9 +28,10 @@ class ObservationEncoder(nn.Module):
     """
     Unified Transformer Encoder for Da Vinci Code.
     
-    28개 토큰이 모두 서로를 attend하는 Full Self-Attention:
+    42개 토큰이 모두 서로를 attend하는 Full Self-Attention:
     - 13 내 카드 토큰
-    - 13 상대 카드 토큰 (+ constraint row 정보 주입)
+    - 13 상대 카드 토큰
+    - 13 constraint 토큰 (별도 토큰, opp와 1:1 대응)
     - 1 PHASE 토큰
     - 1 DECK 토큰
     
@@ -47,11 +48,11 @@ class ObservationEncoder(nn.Module):
     
     Output interface (기존과 동일):
     - features: (batch, hidden_dim) global state features
-    - constraint_per_pos: (batch, 13, 32) for value head conditioning
+    - constraint_per_pos: (batch, 13, token_dim) linear constraint features per opponent position
     - opponent_per_pos: (batch, 13, 64) attention-enriched opponent features
     """
     
-    NUM_TOKENS = MAX_HAND_SIZE * 2 + 2  # 13+13+1+1 = 28
+    NUM_TOKENS = MAX_HAND_SIZE * 3 + 2 + 1  # 13+13+13+1+1+1(CLS) = 42
     
     def __init__(
         self,
@@ -82,23 +83,23 @@ class ObservationEncoder(nn.Module):
         # Hand position: 0-12
         self.position_embed = nn.Embedding(MAX_HAND_SIZE, 16)
         
-        # Segment type: my_card=0, opp_card=1, phase=2, deck=3
-        self.segment_embed = nn.Embedding(4, token_dim)
+        # Segment type: my_card=0, opp_card=1, phase=2, deck=3, constraint=4
+        self.segment_embed = nn.Embedding(5, token_dim)
         
-        # Card feature projection: 16(color)+32(value)+16(pos) = 64 → token_dim
+        # [CLS] token for global state aggregation (BERT-style)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, token_dim))
+        
+        # Card feature projection: 16(color)+32(value)+16(pos)+1(continuous_pos) = 65 → token_dim
         self.card_proj = nn.Sequential(
-            nn.Linear(64, token_dim),
+            nn.Linear(65, token_dim),
             nn.LayerNorm(token_dim),
             nn.ReLU()
         )
         
-        # Constraint row projection: 상대 각 포지션의 가능한 값 분포를 토큰에 주입
-        # constraint_matrix[i] = (13,) binary vector → token_dim
-        self.constraint_row_proj = nn.Sequential(
-            nn.Linear(NUM_VALUES, token_dim),
-            nn.LayerNorm(token_dim),
-            nn.ReLU()
-        )
+        # Constraint row projection: REMOVED — constraint is now injected via CNN.
+        # See constraint_cnn_proj below.
+        
+
         
         # Special token projections
         self.phase_proj = nn.Sequential(
@@ -121,13 +122,13 @@ class ObservationEncoder(nn.Module):
             encoder_layer, num_layers=n_layers
         )
         
-        # === Constraint CNN (value head conditioning용, 기존 유지) ===
-        # 2D grid 데이터에는 CNN이 여전히 적합
-        self.constraint_conv = nn.Sequential(
-            nn.Conv2d(in_channels=1, out_channels=16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, padding=1),
-            nn.ReLU(),
+        # Constraint tokenizer: (batch, 13, 13) → (batch, 13, token_dim)
+        # 13 = value candidates 0-12 per slot (color is conveyed via opp_hand token)
+        # Injected directly into opp_tokens before Transformer for Self-Attention.
+        self.constraint_proj = nn.Sequential(
+            nn.Linear(NUM_VALUES, token_dim),
+            nn.LayerNorm(token_dim),
+            nn.ReLU()
         )
         
         # === Output projections ===
@@ -171,11 +172,15 @@ class ObservationEncoder(nn.Module):
         # Position indices
         positions = torch.arange(MAX_HAND_SIZE, device=device).unsqueeze(0).expand(batch_size, -1)
         
-        # Embed and concatenate: (batch, 13, 16+32+16=64)
+        # Continuous position scalar: [0.0, 0.083, ..., 1.0] encodes left<right ordering
+        pos_continuous = (positions.float() / (MAX_HAND_SIZE - 1)).unsqueeze(-1)  # (batch, 13, 1)
+        
+        # Embed and concatenate: (batch, 13, 16+32+16+1=65)
         token = torch.cat([
             self.color_embed(colors),       # (batch, 13, 16)
             self.value_embed(values),        # (batch, 13, 32)
-            self.position_embed(positions)   # (batch, 13, 16)
+            self.position_embed(positions),  # (batch, 13, 16)
+            pos_continuous                   # (batch, 13, 1)
         ], dim=-1)
         
         return self.card_proj(token)  # (batch, 13, token_dim)
@@ -203,7 +208,7 @@ class ObservationEncoder(nn.Module):
         Returns:
             Tuple of:
                 - features: (batch, hidden_dim) global state features
-                - constraint_per_pos: (batch, 13, 32) for value head conditioning  
+                - constraint_per_pos: (batch, 13, token_dim) linear constraint features per opponent position
                 - opponent_per_pos: (batch, 13, 64) attention-enriched features
         """
         phase = obs["phase"].float()
@@ -215,60 +220,64 @@ class ObservationEncoder(nn.Module):
         batch_size = my_hand.size(0)
         device = my_hand.device
         
-        # === Build 28 tokens ===
+        # === Constraint tokenization: Linear projection per position ===
+        # (batch, 13, 13) → (batch, 13, token_dim) — one token per opponent position
+        constraint_per_pos = self.constraint_proj(constraint_matrix)  # (batch, 13, token_dim)
         
-        # [0:13] My card tokens
+        # === Build 29 tokens ===
+        
+        # [1:14] My card tokens
         my_tokens = self._tokenize_hand(my_hand)  # (batch, 13, token_dim)
         my_seg = torch.zeros(batch_size, MAX_HAND_SIZE, dtype=torch.long, device=device)
         my_tokens = my_tokens + self.segment_embed(my_seg)
         
-        # [13:26] Opponent card tokens + constraint row info
+        # [14:27] Opponent card tokens
         opp_tokens = self._tokenize_hand(opponent_hand)  # (batch, 13, token_dim)
         opp_seg = torch.ones(batch_size, MAX_HAND_SIZE, dtype=torch.long, device=device)
         opp_tokens = opp_tokens + self.segment_embed(opp_seg)
-        # 각 상대 포지션에 "가능한 값 분포" 정보를 직접 주입
-        # → Attention이 이 정보를 기반으로 소거/추론 수행
-        constraint_info = self.constraint_row_proj(constraint_matrix)  # (batch, 13, token_dim)
-        opp_tokens = opp_tokens + constraint_info
-        
-        # [26] PHASE token
+
+        # [27:40] Constraint tokens — 별도 토큰, opp 슬롯과 1:1 대응
+        # opp와 분리하면 Transformer가 둘의 관계를 스스로 attention으로 학습
+        constraint_tokens = constraint_per_pos  # (batch, 13, token_dim)
+        constraint_seg = torch.full((batch_size, MAX_HAND_SIZE), 4, dtype=torch.long, device=device)
+        constraint_tokens = constraint_tokens + self.segment_embed(constraint_seg)
+
+        # [40] PHASE token
         phase_token = self.phase_proj(phase).unsqueeze(1)  # (batch, 1, token_dim)
         phase_seg = torch.full((batch_size, 1), 2, dtype=torch.long, device=device)
         phase_token = phase_token + self.segment_embed(phase_seg)
         
-        # [27] DECK token
+        # [28] DECK token
         deck_token = self.deck_proj(remaining_deck).unsqueeze(1)  # (batch, 1, token_dim)
         deck_seg = torch.full((batch_size, 1), 3, dtype=torch.long, device=device)
         deck_token = deck_token + self.segment_embed(deck_seg)
         
-        # Concatenate: [my(13) | opp(13) | phase(1) | deck(1)] = 28 tokens
-        all_tokens = torch.cat([my_tokens, opp_tokens, phase_token, deck_token], dim=1)
+        # [0] CLS token — prepended for global state aggregation
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # (batch, 1, token_dim)
         
-        # Padding mask: my_pad + opp_pad + False(phase) + False(deck)
+        # Concatenate: [CLS(1) | my(13) | opp(13) | constraint(13) | phase(1) | deck(1)] = 42 tokens
+        all_tokens = torch.cat([cls_tokens, my_tokens, opp_tokens, constraint_tokens, phase_token, deck_token], dim=1)
+
+        # Padding mask: CLS never masked; constraint shares opp's padding mask
         my_pad = self._get_padding_mask(my_hand)         # (batch, 13)
         opp_pad = self._get_padding_mask(opponent_hand)   # (batch, 13)
+        cls_pad = torch.zeros(batch_size, 1, dtype=torch.bool, device=device)
         special_pad = torch.zeros(batch_size, 2, dtype=torch.bool, device=device)
-        all_pad = torch.cat([my_pad, opp_pad, special_pad], dim=1)  # (batch, 28)
+        all_pad = torch.cat([cls_pad, my_pad, opp_pad, opp_pad, special_pad], dim=1)  # (batch, 42)
         
         # === Full Self-Attention (4 layers) ===
-        # 모든 토큰이 서로 attend → 소거, 정렬 제약, 연쇄 추론이 자동으로 학습됨
+        # All 42 tokens attend to each other → multi-hop chained reasoning
         all_tokens = self.transformer(all_tokens, src_key_padding_mask=all_pad)
         
         # === Extract outputs ===
         
-        # Opponent per-position: tokens[13:26] → (batch, 13, 64)
-        opp_out = all_tokens[:, MAX_HAND_SIZE:2 * MAX_HAND_SIZE, :]
-        opponent_per_pos = self.opp_per_pos_proj(opp_out)
-        
-        # Global features: masked mean pool over all 28 tokens → hidden_dim
-        all_mask_f = (~all_pad).unsqueeze(-1).float()  # (batch, 28, 1)
-        global_feat = (all_tokens * all_mask_f).sum(dim=1) / all_mask_f.sum(dim=1).clamp(min=1)
+        # [CLS] token output → global features (no dilution via pooling)
+        global_feat = all_tokens[:, 0, :]  # (batch, token_dim)
         features = self.fusion(global_feat)  # (batch, hidden_dim)
         
-        # Constraint per-position (CNN path for value head conditioning)
-        cm = constraint_matrix.unsqueeze(1)  # (batch, 1, 13, 13)
-        constraint_conv_out = self.constraint_conv(cm)  # (batch, 32, 13, 13)
-        constraint_per_pos = constraint_conv_out.max(dim=3)[0].permute(0, 2, 1)  # (batch, 13, 32)
+        # Opponent per-position: tokens[14:27] (shifted by 1 for CLS) → (batch, 13, 64)
+        opp_out = all_tokens[:, MAX_HAND_SIZE + 1:2 * MAX_HAND_SIZE + 1, :]
+        opponent_per_pos = self.opp_per_pos_proj(opp_out)
         
         return features, constraint_per_pos, opponent_per_pos
 
@@ -302,19 +311,20 @@ class PhaseGatedActionHead(nn.Module):
         )
         
         # Position head for GUESS phase - per-position features
-        # Input: global features + opponent_per_pos + constraint_per_pos per position
-        # (hidden_dim + 64 + 32) per position → 1 logit per position
+        # Input: global features + opponent_per_pos (constraint baked in via Transformer)
+        # (hidden_dim + 64) per position → 1 logit per position
         self.position_head = nn.Sequential(
-            nn.Linear(hidden_dim + 64 + 32, 128),
+            nn.Linear(hidden_dim + 64, 128),
             nn.ReLU(),
             nn.Linear(128, 1)
         )
         
         # Value head for GUESS phase - CONDITIONED on position
-        # Takes features + position embedding + constraint features for that position
+        # Takes features + position embedding + opponent_per_pos for that position
+        # opponent_per_pos already encodes constraint info (injected before Transformer)
         self.position_embedding = nn.Embedding(MAX_HAND_SIZE, 32)
         self.value_head = nn.Sequential(
-            nn.Linear(hidden_dim + 32 + 32, 128),  # features + pos_embed + constraint_per_pos
+            nn.Linear(hidden_dim + 32 + 64, 128),  # features + pos_embed + opp_per_pos
             nn.ReLU(),
             nn.Linear(128, 64),
             nn.ReLU(),
@@ -332,7 +342,6 @@ class PhaseGatedActionHead(nn.Module):
         self,
         features: torch.Tensor,
         phase: torch.Tensor,
-        constraint_per_pos: torch.Tensor,
         action_mask: Optional[Dict[str, torch.Tensor]] = None,
         selected_position: Optional[torch.Tensor] = None,
         opponent_per_pos: Optional[torch.Tensor] = None
@@ -343,10 +352,11 @@ class PhaseGatedActionHead(nn.Module):
         Args:
             features: Encoded observation features (batch, hidden_dim)
             phase: One-hot phase vector (batch, 3)
-            constraint_per_pos: Per-position constraint features (batch, 13, 32)
             action_mask: Optional masks for each action head
             selected_position: Position selected for value conditioning (batch,)
-            opponent_per_pos: Per-position opponent hand features (batch, 13, 64)
+            opponent_per_pos: Per-position opponent features (batch, 13, 64)
+                              Encodes constraint info injected before Transformer.
+                              Used by both position head and value head.
             
         Returns:
             Dictionary of action logits for each head
@@ -357,31 +367,36 @@ class PhaseGatedActionHead(nn.Module):
         # Compute raw logits for heads that don't need conditioning
         color_logits = self.color_head(features)
         
-        # Position head with per-position features
+        # Position head with per-position features (constraint baked into opp_per_pos via Transformer)
         features_expanded = features.unsqueeze(1).expand(-1, MAX_HAND_SIZE, -1)  # (batch, 13, hidden_dim)
         if opponent_per_pos is not None:
-            position_input = torch.cat([features_expanded, opponent_per_pos, constraint_per_pos], dim=-1)
+            position_input = torch.cat([features_expanded, opponent_per_pos], dim=-1)
         else:
             dummy_opp = torch.zeros(batch_size, MAX_HAND_SIZE, 64, device=device)
-            position_input = torch.cat([features_expanded, dummy_opp, constraint_per_pos], dim=-1)
+            position_input = torch.cat([features_expanded, dummy_opp], dim=-1)
         position_logits = self.position_head(position_input).squeeze(-1)  # (batch, 13)
         
         decision_logits = self.decision_head(features)
         
-        # Value head is conditioned on position
+        # Value head is conditioned on position; uses opponent_per_pos (carries constraint info)
         if selected_position is not None:
             pos_embed = self.position_embedding(selected_position)  # (batch, 32)
-            # Get constraint features for selected positions
             batch_indices = torch.arange(batch_size, device=device)
-            pos_constraint = constraint_per_pos[batch_indices, selected_position]  # (batch, 32)
-            value_input = torch.cat([features, pos_embed, pos_constraint], dim=-1)
+            if opponent_per_pos is not None:
+                pos_opp = opponent_per_pos[batch_indices, selected_position]  # (batch, 64)
+            else:
+                pos_opp = torch.zeros(batch_size, 64, device=device)
+            value_input = torch.cat([features, pos_embed, pos_opp], dim=-1)
             value_logits = self.value_head(value_input)
         else:
             # Default: use position 0 (will be masked anyway if not in GUESS phase)
             default_pos = torch.zeros(batch_size, dtype=torch.long, device=device)
             pos_embed = self.position_embedding(default_pos)
-            pos_constraint = constraint_per_pos[:, 0]
-            value_input = torch.cat([features, pos_embed, pos_constraint], dim=-1)
+            if opponent_per_pos is not None:
+                pos_opp = opponent_per_pos[:, 0]
+            else:
+                pos_opp = torch.zeros(batch_size, 64, device=device)
+            value_input = torch.cat([features, pos_embed, pos_opp], dim=-1)
             value_logits = self.value_head(value_input)
         
         # Apply action masks if provided (use MASK_VALUE for numerical stability)
@@ -509,8 +524,23 @@ class DaVinciCodePolicy(nn.Module):
         self.action_heads = PhaseGatedActionHead(hidden_dim)
         self.value_head = ValueHead(hidden_dim)
         
+        # Belief head: predict opponent's hidden card values
+        # Input: global features (hidden_dim) + per-position features (64d) concat → (batch, 13, 13)
+        # Global context enables cross-card reasoning: "B-5 in my hand → opp hidden(B) ≠ 5"
+        self.belief_head = nn.Sequential(
+            nn.Linear(self.hidden_dim + 64, 128),
+            nn.ReLU(),
+            nn.Linear(128, NUM_VALUES)
+        )
+        # Projects belief probability distribution (13d) to opponent feature space (64d) as residual
+        # Zero-initialized: enrichment starts at 0, grows as belief quality improves
+        self.belief_to_opp_proj = nn.Linear(NUM_VALUES, 64)
+
         # Initialize weights with orthogonal initialization for better training
         self.apply(self._init_weights)
+        # Override: zero-init belief_to_opp_proj so enrichment starts neutral → preserves checkpoint
+        nn.init.zeros_(self.belief_to_opp_proj.weight)
+        nn.init.zeros_(self.belief_to_opp_proj.bias)
     
     def _init_weights(self, module: nn.Module) -> None:
         """Initialize weights using orthogonal initialization."""
@@ -524,6 +554,41 @@ class DaVinciCodePolicy(nn.Module):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+    def _enrich_opp_with_belief(
+        self, features: torch.Tensor, opponent_per_pos: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute belief predictions and inject into opponent features as a residual.
+
+        CE loss gradient flows through belief_head -> encoder (no detach on belief_logits).
+        belief_probs are detached before being passed to action heads so RL gradient
+        cannot back-propagate through belief_head — avoids the gradient conflict that
+        caused the original belief-action connection to fail.
+
+        belief_to_opp_proj is zero-initialized: enrichment starts at 0 and grows
+        naturally as belief quality improves. This preserves loaded checkpoint behaviour.
+
+        Returns:
+            enriched_opp:  (batch, 13, 64) — same shape as opponent_per_pos
+            belief_logits: (batch, 13, 13) — raw logits for CE auxiliary loss
+        """
+        # Detach features before belief_head: belief CE gradient must NOT reach the encoder.
+        # encoder is shared by value_head and belief_head; competing gradients from
+        # the two objectives (game outcome vs. card distribution) push features in
+        # conflicting directions, causing value_loss to inflate.
+        # Detaching here lets belief still USE global context in the forward pass
+        # (prediction quality unchanged) while fully protecting the encoder.
+        global_exp = features.detach().unsqueeze(1).expand(-1, MAX_HAND_SIZE, -1)
+        # Combine with per-position features: (batch, 13, hidden_dim+64)
+        combined = torch.cat([global_exp, opponent_per_pos], dim=-1)
+        # Belief logits — gradient flows through belief_head only (not into encoder)
+        belief_logits = self.belief_head(combined)          # (batch, 13, 13)
+        # Detach before action heads: RL signal must not contaminate belief head
+        belief_probs = belief_logits.detach().softmax(dim=-1)  # (batch, 13, 13)
+        # Project to opponent feature space and add as residual
+        belief_residual = self.belief_to_opp_proj(belief_probs)  # (batch, 13, 64)
+        return opponent_per_pos + belief_residual, belief_logits
     
     def forward(
         self,
@@ -544,15 +609,17 @@ class DaVinciCodePolicy(nn.Module):
         """
         # Encode observation
         features, constraint_per_pos, opponent_per_pos = self.encoder(obs)
-        
+
+        # Enrich opponent features with belief predictions
+        enriched_opp, _ = self._enrich_opp_with_belief(features, opponent_per_pos)
+
         # Get action logits with phase gating
         action_logits = self.action_heads(
             features, 
             obs["phase"].float(), 
-            constraint_per_pos,
             action_mask,
             selected_position,
-            opponent_per_pos=opponent_per_pos
+            opponent_per_pos=enriched_opp
         )
         
         # Get state value
@@ -586,7 +653,10 @@ class DaVinciCodePolicy(nn.Module):
         
         # Encode observation (only once)
         features, constraint_per_pos, opponent_per_pos = self.encoder(obs)
-        
+
+        # Enrich opponent features with belief predictions
+        enriched_opp, _ = self._enrich_opp_with_belief(features, opponent_per_pos)
+
         # Get state value (only uses features, no need to recompute)
         value = self.value_head(features)
         
@@ -600,9 +670,9 @@ class DaVinciCodePolicy(nn.Module):
         # Compute heads that don't need position conditioning
         color_logits = self.action_heads.color_head(features)
         
-        # Position head with per-position features
+        # Position head with per-position features (using belief-enriched opponent)
         features_expanded = features.unsqueeze(1).expand(-1, MAX_HAND_SIZE, -1)  # (batch, 13, hidden_dim)
-        position_input = torch.cat([features_expanded, opponent_per_pos, constraint_per_pos], dim=-1)
+        position_input = torch.cat([features_expanded, enriched_opp], dim=-1)
         position_logits = self.action_heads.position_head(position_input).squeeze(-1)  # (batch, 13)
         
         decision_logits = self.action_heads.decision_head(features)
@@ -650,8 +720,8 @@ class DaVinciCodePolicy(nn.Module):
         if any_guess:
             pos_embed = self.action_heads.position_embedding(position_action)
             batch_indices = torch.arange(batch_size, device=device)
-            pos_constraint = constraint_per_pos[batch_indices, position_action]
-            value_input = torch.cat([features, pos_embed, pos_constraint], dim=-1)
+            pos_opp = enriched_opp[batch_indices, position_action]  # (batch, 64)
+            value_input = torch.cat([features, pos_embed, pos_opp], dim=-1)
             value_logits = self.action_heads.value_head(value_input)
             
             # Apply value mask (per-position: select row for chosen position)
@@ -745,7 +815,7 @@ class DaVinciCodePolicy(nn.Module):
         obs: Dict[str, torch.Tensor],
         actions: Dict[str, torch.Tensor],
         action_mask: Optional[Dict[str, torch.Tensor]] = None
-    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
         """
         Evaluate log probabilities and entropy for given actions.
         
@@ -757,23 +827,26 @@ class DaVinciCodePolicy(nn.Module):
             action_mask: Optional action masks
             
         Returns:
-            Tuple of (log_probs_dict, state_value, entropy_dict)
+            Tuple of (log_probs_dict, state_value, entropy_dict, belief_logits)
+            belief_logits: (batch, 13, 13) predicted value distribution per opponent position
         """
         phase = obs["phase"]
         
         # Encode and get features
         features, constraint_per_pos, opponent_per_pos = self.encoder(obs)
         
+        # Enrich opponent features with belief predictions (also returns logits for CE loss)
+        enriched_opp, belief_logits = self._enrich_opp_with_belief(features, opponent_per_pos)
+
         # Get action logits with position conditioning for value head
         action_logits = self.action_heads(
             features,
             phase.float(),
-            constraint_per_pos,
             action_mask,
             selected_position=actions["position"],  # Use actual position taken
-            opponent_per_pos=opponent_per_pos
+            opponent_per_pos=enriched_opp
         )
-        
+
         # Get state value
         value = self.value_head(features)
         
@@ -809,7 +882,7 @@ class DaVinciCodePolicy(nn.Module):
             log_probs[key] = log_prob
             entropies[key] = entropy
         
-        return log_probs, value, entropies
+        return log_probs, value, entropies, belief_logits
 
 
 def obs_to_tensor(
