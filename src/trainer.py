@@ -39,8 +39,9 @@ class PPOConfig:
     total_timesteps: int = 1000000000
     learning_rate: float =8e-5  # CNN 시절 1.25e-4에서 소폭 낮춤 (Transformer 안정성)
     n_envs: int =300  # 수집 병목 해소: epu=20 채우는 시간 최소화
+    n_workers: int = 6  # rollout subproc 워커 수 = CPU 코어 수 (과구독 방지)
     episodes_per_update: int = 300 # n_envs와 동일 → ~1라운드로 수집 완료
-    batch_size: int = 1096  # CNN 시절 8192에서 절충 (메모리×에피소드 량 고려)
+    batch_size: int = 4096  # 1096→4096: minibatch 오버헤드↓, GPU/VRAM 활용↑ (CPU 병목 머신)
     n_epochs: int = 8  # 에포크 늘려 데이터 재사용 극대화
     
     # PPO specific
@@ -142,7 +143,7 @@ class PPOTrainer:
         self.n_envs = config.n_envs
         self._use_subproc = config.n_envs > 1
         if self._use_subproc:
-            self.vec_env = SubprocVecEnv(n_envs=config.n_envs)
+            self.vec_env = SubprocVecEnv(n_envs=config.n_envs, n_workers=config.n_workers)
         else:
             self.vec_env = VectorDaVinciEnv(n_envs=config.n_envs)
         self.env = self.vec_env.get_viz_env()  # For visualization compatibility
@@ -1303,13 +1304,13 @@ class PPOTrainer:
         print(f"Starting training on {self.device}")
         print(f"Config: {self.config}")
         print("-" * 60)
-        
+
         update_count = 0
         
         while self.timesteps < self.config.total_timesteps:
             # Collect rollouts
             rollout_stats = self.collect_rollouts()
-            
+
             # Update policy
             update_stats = self.update()
             update_count += 1

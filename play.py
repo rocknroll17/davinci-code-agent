@@ -634,7 +634,7 @@ def main():
     
     if os.path.exists(args.checkpoint):
         checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        policy.load_state_dict(checkpoint["policy_state_dict"])
+        policy.load_state_dict(checkpoint["policy_state_dict"], strict=False)
         timesteps = checkpoint.get("timesteps", 0)
         console.print(f"[green]✓ Loaded checkpoint (trained for {timesteps:,} timesteps)[/]")
     else:

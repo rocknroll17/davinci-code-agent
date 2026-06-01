@@ -80,7 +80,9 @@ class ModelAgent:
         policy = DaVinciCodePolicy(hidden_dim=hidden_dim).to(device)
 
         state_dict = checkpoint.get("policy_state_dict", checkpoint)
-        policy.load_state_dict(state_dict)
+        # strict=False tolerates architecture additions (e.g. slot_pos_embed) when
+        # loading older checkpoints; missing params keep their fresh init.
+        policy.load_state_dict(state_dict, strict=False)
 
         agent = cls(policy, device)
         agent._checkpoint_path = path
