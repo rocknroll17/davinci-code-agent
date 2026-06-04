@@ -21,7 +21,7 @@ from src.episode import Episode
 from src.reward_config import RewardConfig
 from src.env import DaVinciCodeEnv
 from src.vec_env import VectorDaVinciEnv, SubprocVecEnv
-from src.constants import CardValue, Phase, Color
+from src.constants import Phase
 from src.result.result import Result
 from src.visualizer import DaVinciVisualizer, get_visualizer
 
@@ -193,91 +193,6 @@ class PPOTrainer:
         for h in self._hooks:
             h.on_training_end(self)
 
-    def _save_obs_tensor(self, obs_tensor: Dict[str, torch.Tensor], player: int) -> None:
-        """
-        Save observation tensors to human-readable .txt for debugging.
-        - 의미 없는 슬롯 제거 (-1, -2)
-        - phase는 문자열로 표시
-        """
-        import numpy as np
-
-        if not obs_tensor:
-            return  # 비어있으면 아무것도 하지 않음
-
-        # 파일 경로 및 이름
-        path_dir = os.path.join(self.config.log_dir, "tensors")
-        os.makedirs(path_dir, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        base = f"tensor_p{player}_{ts}_{self.timesteps}"
-        txt_path = os.path.join(path_dir, f"{base}.txt")
-
-        # CPU 복사
-        cpu_dict = {k: v.detach().cpu() for k, v in obs_tensor.items()}
-
-        # 카드/값 문자열 변환 함수
-        def card_to_str(card_arr, is_hidden: bool = False) -> str:
-            color, value = card_arr
-            if value == -1:
-                if is_hidden:
-                    return "???"
-            elif value == -2:
-                return ""
-            val_str = "JOKER" if value == CardValue.JOKER else str(value)
-            color_str = "W" if color == 1 else "B"
-            
-            return f"{color_str} {val_str}"
-        
-        def constraint_to_str(mat: np.ndarray) -> str:
-            """
-            -1만 있는 행은 제거
-            """
-            # 행 중 -1만 있는 것 제거
-            valid_rows = ~np.all(mat == -1, axis=1)
-            trimmed_mat = mat[valid_rows]
-
-            if trimmed_mat.size == 0:
-                return "<empty constraint>"
-
-            return np.array2string(trimmed_mat, threshold=1000, max_line_width=200)
-        
-        # Phase 문자열 매핑
-        PHASE_MAP = {0: "DRAW", 1: "GUESS", 2: "DECISION"}
-
-        with open(txt_path, "w") as f:
-            f.write(f"# Observation tensors for player {player} at {ts}, timestep={self.timesteps}\n")
-
-            for key, tensor in cpu_dict.items():
-                try:
-                    arr = tensor.numpy()
-                except Exception:
-                    arr = "<unserializable tensor>"
-
-                f.write(f"\n## {key} (shape={getattr(arr, 'shape', 'unknown')})\n")
-
-                # 특별 처리: phase
-                if key == "phase" and isinstance(arr, np.ndarray):
-                    phase_idx = int(np.argmax(arr))
-                    phase_str = PHASE_MAP.get(phase_idx, f"unknown({phase_idx})")
-                    f.write(f"Phase: {phase_str}\n")
-                    continue
-
-                # 카드 텐서 처리
-                if key in ("my_hand", "opponent_hand") and isinstance(arr, np.ndarray):
-                    cards = [card_to_str(c, is_hidden=(key == "opponent_hand")) for c in arr[0] if card_to_str(c)]
-                    f.write(f"{', '.join(cards)}\n")
-                    continue
-
-                # constraint_matrix는 필요한 부분만 요약
-                if key == "constraint_matrix" and isinstance(arr, np.ndarray):
-                    f.write(constraint_to_str(arr[0]) + "\n")
-                    continue
-
-                # 나머지 일반 텐서
-                if isinstance(arr, np.ndarray):
-                    f.write(np.array2string(arr, threshold=1000, max_line_width=200) + "\n")
-                else:
-                    f.write(str(arr) + "\n")
-
     def _batch_obs_to_tensor(
         self,
         obs: Dict[str, np.ndarray]
@@ -300,21 +215,82 @@ class PPOTrainer:
     
     def collect_rollouts(self) -> Dict[str, float]:
         """
-        Collect rollout data using current policy with vectorized environments.
-        
-        Supports both VectorDaVinciEnv (thread-based) and SubprocVecEnv (multiprocessing).
-        SubprocVecEnv uses auto-reset (done envs reset inside workers).
-        
+        Collect rollout data using the current policy with vectorized envs.
+
+        Single loop for both backends. Backend differences are only at episode
+        close: SubprocVecEnv auto-resets inside workers and reports the winner +
+        reset obs via the info dict; VectorDaVinciEnv (threaded) reads the winner
+        from the env and resets it directly, and drives the live visualizer.
+
         Returns:
             Dictionary of rollout statistics
         """
-        if self._use_subproc:
-            return self._collect_rollouts_subproc()
-        else:
-            return self._collect_rollouts_threaded()
-    
+        self.buffer.clear()
+        obs, infos = self.vec_env.reset()
+        backend = "multiprocess" if self._use_subproc else "threaded"
+        logger.info(f"Starting rollout collection with {self.n_envs} parallel envs ({backend})")
+
+        episode_rewards = np.zeros(self.n_envs, dtype=np.float32)
+        episode_lengths = np.zeros(self.n_envs, dtype=np.int32)
+        completed_rewards: List[float] = []
+        completed_lengths: List[float] = []
+        per_env_tracking = [Episode(i, self.config.reward_config) for i in range(self.n_envs)]
+        steps_collected = 0
+        episodes_collected = 0
+        target_episodes = self.config.episodes_per_update
+
+        while episodes_collected < target_episodes:
+            action_masks_np = self.vec_env.get_action_masks()
+            obs_tensor = self._batch_obs_to_tensor(obs)
+            action_mask_tensor = self._batch_mask_to_tensor(action_masks_np)
+
+            with torch.no_grad():
+                actions, log_probs, values = self.policy.get_action(obs_tensor, action_mask_tensor)
+
+            next_obs, rewards, terminated, truncated, next_infos, results = self.vec_env.step(actions)
+            dones = terminated | truncated
+
+            log_probs_np_all = {k: v.cpu().numpy() for k, v in log_probs.items()}
+            values_np_all = values.cpu().numpy().flatten()
+
+            for i in range(self.n_envs):
+                self._add_transition_and_track(
+                    i, obs, actions, rewards, dones, results, next_infos,
+                    log_probs_np_all, values_np_all, action_masks_np,
+                    per_env_tracking, episode_rewards, episode_lengths,
+                )
+                steps_collected += 1
+
+                if dones[i]:
+                    if self._use_subproc:
+                        # Worker already auto-reset; winner + reset obs come via info.
+                        winner = next_infos[i].get("_winner")
+                        reset_obs = next_infos[i].get("_reset_obs")
+                    else:
+                        # Thread backend: read winner from env, reset it here.
+                        winner = self.vec_env.envs[i]._winner
+                        reset_obs, next_infos[i] = self.vec_env.reset_single(i)
+                    self._close_episode(
+                        i, obs, next_obs, per_env_tracking,
+                        episode_rewards, episode_lengths,
+                        completed_rewards, completed_lengths,
+                        winner, reset_obs,
+                    )
+                    episodes_collected += 1
+
+            # Live visualizer is only driven by the threaded backend.
+            if not self._use_subproc:
+                viz = get_visualizer()
+                if viz is not None:
+                    self._update_viz_from_vec(viz, rewards[0], episode_rewards[0], actions[0], results[0])
+
+            obs = next_obs
+            infos = next_infos
+
+        return self._finalize_rollouts(obs, completed_rewards, completed_lengths, steps_collected)
+
     # -------------------------------------------------------------------------
-    # Rollout helpers — shared by threaded and subproc collection
+    # Rollout helpers
     # -------------------------------------------------------------------------
 
     def _add_transition_and_track(
@@ -402,126 +378,6 @@ class PPOTrainer:
         episode_rewards[i] = 0.0
         episode_lengths[i] = 0
 
-    # -------------------------------------------------------------------------
-
-    def _collect_rollouts_threaded(self) -> Dict[str, float]:
-        """Original thread-based rollout collection (VectorDaVinciEnv)."""
-        self.buffer.clear()
-        obs, infos = self.vec_env.reset()
-        logger.info(f"Starting rollout collection with {self.n_envs} parallel envs (threaded)")
-
-        episode_rewards = np.zeros(self.n_envs, dtype=np.float32)
-        episode_lengths = np.zeros(self.n_envs, dtype=np.int32)
-        completed_rewards: List[float] = []
-        completed_lengths: List[float] = []
-        per_env_tracking = [Episode(i, self.config.reward_config) for i in range(self.n_envs)]
-        steps_collected = 0
-        episodes_collected = 0
-        target_episodes = self.config.episodes_per_update
-
-        while episodes_collected < target_episodes:
-            action_masks_np = self.vec_env.get_action_masks()
-            obs_tensor = self._batch_obs_to_tensor(obs)
-            action_mask_tensor = self._batch_mask_to_tensor(action_masks_np)
-
-            with torch.no_grad():
-                actions, log_probs, values = self.policy.get_action(obs_tensor, action_mask_tensor)
-
-            next_obs, rewards, terminated, truncated, next_infos, results = self.vec_env.step(actions)
-            dones = terminated | truncated
-
-            log_probs_np_all = {k: v.cpu().numpy() for k, v in log_probs.items()}
-            values_np_all = values.cpu().numpy().flatten()
-
-            for i in range(self.n_envs):
-                self._add_transition_and_track(
-                    i, obs, actions, rewards, dones, results, next_infos,
-                    log_probs_np_all, values_np_all, action_masks_np,
-                    per_env_tracking, episode_rewards, episode_lengths,
-                )
-                steps_collected += 1
-
-                if dones[i]:
-                    winner = self.vec_env.envs[i]._winner
-                    new_obs, next_infos[i] = self.vec_env.reset_single(i)
-                    self._close_episode(
-                        i, obs, next_obs, per_env_tracking,
-                        episode_rewards, episode_lengths,
-                        completed_rewards, completed_lengths,
-                        winner, new_obs,
-                    )
-                    episodes_collected += 1
-
-            viz = get_visualizer()
-            if viz is not None:
-                self._update_viz_from_vec(viz, rewards[0], episode_rewards[0], actions[0], results[0])
-
-            obs = next_obs
-            infos = next_infos
-
-        return self._finalize_rollouts(obs, completed_rewards, completed_lengths, steps_collected)
-
-    def _collect_rollouts_subproc(self) -> Dict[str, float]:
-        """
-        Multiprocessing-based rollout collection (SubprocVecEnv).
-
-        Key differences from threaded version:
-        - env.step() runs in parallel worker processes (true CPU parallelism)
-        - Finetune case checking runs inside workers (no GIL bottleneck)
-        - Auto-reset: done envs reset inside workers (no extra round-trip)
-        - Winner info comes from info dict (not direct env access)
-        """
-        self.buffer.clear()
-        obs, infos = self.vec_env.reset()
-        logger.info(f"Starting rollout collection with {self.n_envs} parallel envs (multiprocess)")
-
-        episode_rewards = np.zeros(self.n_envs, dtype=np.float32)
-        episode_lengths = np.zeros(self.n_envs, dtype=np.int32)
-        completed_rewards: List[float] = []
-        completed_lengths: List[float] = []
-        per_env_tracking = [Episode(i, self.config.reward_config) for i in range(self.n_envs)]
-        steps_collected = 0
-        episodes_collected = 0
-        target_episodes = self.config.episodes_per_update
-
-        while episodes_collected < target_episodes:
-            action_masks_np = self.vec_env.get_action_masks()
-            obs_tensor = self._batch_obs_to_tensor(obs)
-            action_mask_tensor = self._batch_mask_to_tensor(action_masks_np)
-
-            with torch.no_grad():
-                actions, log_probs, values = self.policy.get_action(obs_tensor, action_mask_tensor)
-
-            next_obs, rewards, terminated, truncated, next_infos, results = self.vec_env.step(actions)
-            dones = terminated | truncated
-
-            log_probs_np_all = {k: v.cpu().numpy() for k, v in log_probs.items()}
-            values_np_all = values.cpu().numpy().flatten()
-
-            for i in range(self.n_envs):
-                self._add_transition_and_track(
-                    i, obs, actions, rewards, dones, results, next_infos,
-                    log_probs_np_all, values_np_all, action_masks_np,
-                    per_env_tracking, episode_rewards, episode_lengths,
-                )
-                steps_collected += 1
-
-                if dones[i]:
-                    winner = next_infos[i].get("_winner")
-                    reset_obs = next_infos[i].get("_reset_obs")
-                    self._close_episode(
-                        i, obs, next_obs, per_env_tracking,
-                        episode_rewards, episode_lengths,
-                        completed_rewards, completed_lengths,
-                        winner, reset_obs,
-                    )
-                    episodes_collected += 1
-
-            obs = next_obs
-            infos = next_infos
-
-        return self._finalize_rollouts(obs, completed_rewards, completed_lengths, steps_collected)
-
     def _finalize_rollouts(
         self,
         obs: Dict[str, np.ndarray],
@@ -586,39 +442,6 @@ class PPOTrainer:
             action=action,
             result=result
         )
-    
-    def update_render_stats(self, reward: float, episode_reward: float, action: np.ndarray, result: Result) -> None:
-        """
-        Update visualization with current game state.
-        Args:
-            render_obs: Render observation dictionary
-            phase_name: Current phase name
-            reward: Reward obtained in last action
-            episode_reward: Total reward in current episode
-            action: Last action taken
-            result: Result object from last action
-        """
-        render_obs, render_info = self.env.render_info()
-        # 시각화 업데이트
-        viz = get_visualizer()
-        if viz is not None:
-            phase_idx = int(np.argmax(render_obs["phase"]))
-            phase_name = Phase(phase_idx).name
-            viz.update_game_state(
-                my_hand=render_obs["my_hand"],
-                opponent_hand=render_obs["opponent_hand"],
-                phase=phase_name,
-                current_player=self.env._current_player,
-                streak=self.env._streak,
-                deck_black=self.env._deck.black_count,
-                deck_white=self.env._deck.white_count,
-                episode=self.episodes,
-                timesteps=self.timesteps,
-                reward=reward,
-                total_reward=episode_reward,
-                action=action[0],
-                result=result
-            )
     
     def update(self) -> Dict[str, float]:
         """
