@@ -836,7 +836,7 @@ class DaVinciCodePolicy(nn.Module):
             probs = F.softmax(safe_logits, dim=-1)
             
             # Add small epsilon to prevent log(0)
-            probs = probs + 1e-8
+            probs = probs + 1e-6
             probs = probs / probs.sum(dim=-1, keepdim=True)
             
             dist = Categorical(probs)
@@ -911,7 +911,7 @@ class DaVinciCodePolicy(nn.Module):
                 probs = F.softmax(safe_logits, dim=-1)
                 
                 # Add small epsilon to prevent log(0)
-                probs = probs + 1e-8
+                probs = probs + 1e-6
                 probs = probs / probs.sum(dim=-1, keepdim=True)
                 
                 dist = Categorical(probs)

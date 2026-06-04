@@ -14,11 +14,12 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 
 from src.buffer import RolloutBuffer, Transition
-from src.constants import Phase
+from src.constants import MASK_VALUE, Phase
 from src.episode import Episode
 from src.model import DaVinciCodePolicy
 from src.result.result import Result
@@ -57,6 +58,10 @@ class PPOConfig:
     n_heads: int = 4   # encoder transformer attention heads (token_dim=128 must be divisible)
     n_layers: int = 4  # encoder transformer layer count
     zero_init: bool = False  # if True, init all default weights/biases to 0 (designated inits kept)
+
+    # Performance
+    fp16: bool = False    # mixed-precision (autocast fp16 + GradScaler). Turing→fp16, not bf16.
+    compile: bool = False  # torch.compile the encoder (skips .any()-branchy get_action)
 
     # Reward policy
     # When True: monotone reward — no win/lose game-outcome signal. Only per-guess
@@ -97,20 +102,27 @@ class PPOTrainer:
     def __init__(
         self,
         config: PPOConfig,
-        device: Optional[torch.device] = None
+        device: Optional[torch.device] = None,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         """
         Initialize PPO trainer.
-        
+
         Args:
             config: Training configuration
             device: Target device (auto-detect if None)
+            rank: this process's DDP rank (0 for single-GPU)
+            world_size: number of DDP ranks (1 for single-GPU)
         """
         self.config = config
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
-        
+        self.rank = rank
+        self.world_size = world_size
+        self.is_main = (rank == 0)
+
         # Initialize policy network
         self.policy = DaVinciCodePolicy(
             config.hidden_dim,
@@ -118,7 +130,19 @@ class PPOTrainer:
             n_layers=config.n_layers,
             zero_init=config.zero_init,
         ).to(self.device)
-        
+
+        # Mixed precision (fp16 + GradScaler). Disabled => no-op.
+        self.scaler = torch.amp.GradScaler("cuda", enabled=config.fp16)
+
+        # Optional: compile the encoder (forward is branch-free; get_action has
+        # data-dependent .any() branches so we leave it uncompiled).
+        if config.compile:
+            try:
+                self.policy.encoder = torch.compile(self.policy.encoder, mode="reduce-overhead")
+            except Exception as e:
+                if rank == 0:
+                    print(f"[compile] disabled ({e})")
+
         # Optimizer
         self.optimizer = optim.Adam(
             self.policy.parameters(),
@@ -136,14 +160,17 @@ class PPOTrainer:
             total_iters=total_updates
         )
         
-        # Vectorized Environment (multiple games in parallel)
+        # Vectorized Environment (multiple games in parallel).
+        # Per-rank seed offset so DDP ranks collect different games (not duplicates).
         self.n_envs = config.n_envs
         self._use_subproc = config.n_envs > 1
+        env_seed = (1 + rank) * 100000 if world_size > 1 else None
         if self._use_subproc:
             self.vec_env = SubprocVecEnv(n_envs=config.n_envs, n_workers=config.n_workers,
-                                         reward_config=config.reward_config)
+                                         seed=env_seed, reward_config=config.reward_config)
         else:
-            self.vec_env = VectorDaVinciEnv(n_envs=config.n_envs, reward_config=config.reward_config)
+            self.vec_env = VectorDaVinciEnv(n_envs=config.n_envs, seed=env_seed,
+                                            reward_config=config.reward_config)
         self.env = self.vec_env.get_viz_env()  # For visualization compatibility
         
         # Rollout buffer (에피소드 기반 수집이라 size 제한 없음)
@@ -244,7 +271,7 @@ class PPOTrainer:
             obs_tensor = self._batch_obs_to_tensor(obs)
             action_mask_tensor = self._batch_mask_to_tensor(action_masks_np)
 
-            with torch.no_grad():
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16, enabled=self.config.fp16):
                 actions, log_probs, values = self.policy.get_action(obs_tensor, action_mask_tensor)
 
             next_obs, rewards, terminated, truncated, next_infos, results = self.vec_env.step(actions)
@@ -454,19 +481,38 @@ class PPOTrainer:
         belief_losses = []
         entropy_losses = []
         
+        # DDP: every rank must run the SAME number of minibatches per epoch,
+        # otherwise the per-batch grad all_reduce counts diverge (ranks collect
+        # different #steps → different ceil(n/batch_size)) → NCCL deadlock.
+        # Agree on the per-epoch minibatch count (min across ranks).
+        n_minibatches = (self.buffer.size + self.config.batch_size - 1) // self.config.batch_size
+        if self.world_size > 1:
+            t = torch.tensor([n_minibatches], device=self.device)
+            dist.all_reduce(t, op=dist.ReduceOp.MIN)
+            n_minibatches = max(1, int(t.item()))
+
         for epoch in range(self.config.n_epochs):
-            for batch in self.buffer.get_batches(
+            for bi, batch in enumerate(self.buffer.get_batches(
                 self.config.batch_size,
                 self._returns,
                 self._advantages
-            ):
-                # Evaluate current policy on batch
-                log_probs, values, entropies, belief_logits = self.policy.evaluate_actions(
-                    batch["obs"],
-                    batch["actions"],
-                    batch["action_mask"]
-                )
-                
+            )):
+                if bi >= n_minibatches:
+                    break  # keep all ranks at the same #minibatches (DDP collective match)
+                # Evaluate current policy on batch (heavy forward in fp16 under autocast).
+                with torch.autocast("cuda", dtype=torch.float16, enabled=self.config.fp16):
+                    log_probs, values, entropies, belief_logits = self.policy.evaluate_actions(
+                        batch["obs"],
+                        batch["actions"],
+                        batch["action_mask"]
+                    )
+                # Upcast outputs to fp32 so the (cheap) loss math is numerically stable.
+                if self.config.fp16:
+                    values = values.float()
+                    belief_logits = belief_logits.float()
+                    log_probs = {k: v.float() for k, v in log_probs.items()}
+                    entropies = {k: v.float() for k, v in entropies.items()}
+
                 # Compute policy loss for each action head
                 policy_loss = torch.tensor(0.0, device=self.device)
                 entropy_sum = torch.tensor(0.0, device=self.device)
@@ -590,8 +636,10 @@ class PPOTrainer:
                         flat_imp     = impossible[hidden_mask]      # (N, 13)
                         # Safety: never mask the true label itself
                         flat_imp.scatter_(1, flat_targets.clamp(0, 12).unsqueeze(1), False)
-                        # Apply: impossible values → -inf before softmax
-                        flat_logits = flat_logits.masked_fill(flat_imp, float('-inf'))
+                        # Apply: impossible values → very negative before softmax.
+                        # MASK_VALUE (finite -1e4) instead of -inf so this stays NaN-safe
+                        # under fp16 autocast (softmax(-1e4) ~ 0, same effect as -inf).
+                        flat_logits = flat_logits.masked_fill(flat_imp, MASK_VALUE)
                         belief_loss = nn.functional.cross_entropy(flat_logits, flat_targets)
                 
                 loss = (
@@ -601,19 +649,36 @@ class PPOTrainer:
                     - self.config.ent_coef * entropy_mean  # Subtract to maximize entropy
                 )
                 
-                # Check for NaN/Inf
-                if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"Warning: Loss is {loss.item()}, skipping batch")
-                    continue
-                
-                # Backprop
+                # NaN/Inf: do NOT `continue` (that would skip this rank's grad
+                # all_reduce → DDP deadlock). Proceed — GradScaler.step auto-skips
+                # the optimizer step when grads are inf/nan, and all_reduce stays matched.
+                if self.is_main and (torch.isnan(loss) or torch.isinf(loss)):
+                    logger.warning("Loss is NaN/Inf this batch — GradScaler will skip the step")
+
+                # Backprop (GradScaler is a no-op when fp16 is disabled).
                 self.optimizer.zero_grad()
-                loss.backward()
+                self.scaler.scale(loss).backward()
+                # DDP: average gradients across ranks (manual — evaluate_actions is
+                # a custom method, so the DDP wrapper's forward hooks don't apply).
+                # Zero-fill missing grads so EVERY rank all-reduces the SAME param
+                # set in the SAME order: phase-gated heads may get no grad in a given
+                # minibatch on one rank but not another → otherwise NCCL shape/seq
+                # mismatch → deadlock. None grad ⇒ this rank contributes zeros.
+                if self.world_size > 1:
+                    for p in self.policy.parameters():
+                        if not p.requires_grad:
+                            continue
+                        if p.grad is None:
+                            p.grad = torch.zeros_like(p)
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                        p.grad.div_(self.world_size)
+                self.scaler.unscale_(self.optimizer)
                 nn.utils.clip_grad_norm_(
-                    self.policy.parameters(), 
+                    self.policy.parameters(),
                     self.config.max_grad_norm
                 )
-                self.optimizer.step()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
                 
                 policy_losses.append(policy_loss.item())
                 value_losses.append(value_loss.item())
@@ -694,11 +759,13 @@ class PPOTrainer:
                 f"checkpoint_{self.timesteps}.pt"
             )
         
+        # Store GLOBAL counts so a checkpoint resumes consistently regardless of
+        # the world_size it was trained / is resumed with.
         torch.save({
             "policy_state_dict": self.policy.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
-            "timesteps": self.timesteps,
-            "episodes": self.episodes,
+            "timesteps": self.world_size * self.timesteps,
+            "episodes": self.world_size * self.episodes,
             "updates": self.updates,
             "config": self.config.to_dict()
         }, path)
@@ -742,8 +809,9 @@ class PPOTrainer:
             except (ValueError, KeyError) as e:
                 print(f"⚠️ Optimizer load failed ({e}), keeping current optimizer state")
         
-        self.timesteps = checkpoint["timesteps"]
-        self.episodes = checkpoint["episodes"]
+        # Checkpoints store GLOBAL counts → back to per-rank local.
+        self.timesteps = checkpoint["timesteps"] // self.world_size
+        self.episodes = checkpoint["episodes"] // self.world_size
         self.updates = checkpoint["updates"]
         
         # Always apply config LR (checkpoint may have old LR)
@@ -759,7 +827,19 @@ class PPOTrainer:
             end_factor=self.config.lr_end / self.config.learning_rate,
             total_iters=remaining
         )
-    
+
+    def _global_timesteps(self) -> int:
+        """True global timestep count, identical on every rank.
+
+        Single-GPU: just the local count. DDP: collective SUM across ranks
+        (must be called by ALL ranks each iteration — it's a collective op).
+        """
+        if self.world_size <= 1:
+            return self.timesteps
+        t = torch.tensor([self.timesteps], device=self.device)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        return int(t.item())
+
     def train(self) -> None:
         """
         Main training loop.
@@ -767,36 +847,40 @@ class PPOTrainer:
         Runs until total_timesteps is reached, alternating between
         collecting rollouts and performing PPO updates.
         """
-        print(f"Starting training on {self.device}")
-        print(f"Config: {self.config}")
-        print("-" * 60)
+        if self.is_main:
+            print(f"Starting training on {self.device} (world_size={self.world_size})")
+            print(f"Config: {self.config}")
+            print("-" * 60)
 
         update_count = 0
-        
-        while self.timesteps < self.config.total_timesteps:
-            # Collect rollouts
-            rollout_stats = self.collect_rollouts()
+        gts = 0  # global timesteps, agreed across ranks (set after each update)
 
-            # Update policy
+        # Loop driven by `update_count` so EVERY rank does the same number of
+        # collect+update iterations (the per-update grad all_reduce stays matched —
+        # no deadlock from ranks disagreeing on a per-rank timestep condition).
+        # `gts` (collective SUM of all ranks' local timesteps) is the true global
+        # step count, identical on all ranks, used to decide when to stop.
+        while True:
+            # Collect rollouts (each rank on its own envs) + synced PPO update.
+            rollout_stats = self.collect_rollouts()
             update_stats = self.update()
             update_count += 1
-            
+            gts = self._global_timesteps()   # collective; identical on all ranks
+
             # Step LR scheduler
             self.scheduler.step()
             current_lr = self.optimizer.param_groups[0]['lr']
-            
-            # Logging
-            if update_count % self.config.log_interval == 0:
+
+            # --- rank-0-only: logging, hooks, eval, checkpoints ---
+            if self.is_main and update_count % self.config.log_interval == 0:
                 print(f"Update {update_count} | "
-                      f"Timesteps: {self.timesteps:,} | "
-                      f"Episodes: {self.episodes} | "
+                      f"Timesteps: {gts:,} | "
+                      f"Episodes: {self.world_size * self.episodes} | "
                       f"Mean Reward: {rollout_stats['mean_reward']:5.2f} | "
                       f"LR: {current_lr:.2e} | "
                       f"Policy Loss: {update_stats['policy_loss']:.4f} | "
                       f"Value Loss: {update_stats['value_loss']:.4f} | "
                       f"Belief Loss: {update_stats['belief_loss']:.4f}")
-                
-                # 시각화 학습 통계 업데이트
                 viz = get_visualizer()
                 if viz is not None:
                     viz.update_training_stats(
@@ -805,59 +889,58 @@ class PPOTrainer:
                         value_loss=update_stats['value_loss']
                     )
                     viz.add_log(f"Update {update_count}: R={rollout_stats['mean_reward']:.2f}")
-                    print(f"Policy Loss: {update_stats['policy_loss']:.4f}, "
-                                f"Value Loss: {update_stats['value_loss']:.4f}")
 
-            # Hooks — emit to dashboard / detect NaN / etc.
-            self._call_hooks_update({
-                "update_count":        update_count,
-                "timesteps":           self.timesteps,
-                "episodes":            self.episodes,
-                "mean_reward":         rollout_stats["mean_reward"],
-                "mean_episode_length": rollout_stats.get("mean_length", 0.0),
-                "policy_loss":         update_stats["policy_loss"],
-                "value_loss":          update_stats["value_loss"],
-                "belief_loss":         update_stats["belief_loss"],
-                "entropy":             update_stats["entropy"],
-                "total_loss":          update_stats["total_loss"],
-                "learning_rate":       current_lr,
-            })
-            
-            # Evaluation
-            if update_count % self.config.eval_interval == 0:
+            if self.is_main:
+                self._call_hooks_update({
+                    "update_count":        update_count,
+                    "timesteps":           gts,
+                    "episodes":            self.world_size * self.episodes,
+                    "mean_reward":         rollout_stats["mean_reward"],
+                    "mean_episode_length": rollout_stats.get("mean_length", 0.0),
+                    "policy_loss":         update_stats["policy_loss"],
+                    "value_loss":          update_stats["value_loss"],
+                    "belief_loss":         update_stats["belief_loss"],
+                    "entropy":             update_stats["entropy"],
+                    "total_loss":          update_stats["total_loss"],
+                    "learning_rate":       current_lr,
+                })
+
+            if self.is_main and update_count % self.config.eval_interval == 0:
                 eval_stats = self.evaluate(self.config.n_eval_episodes)
                 print(f"\n[Eval] P0 Win Rate: {eval_stats['player0_win_rate']:.2%} | "
                       f"P1 Win Rate: {eval_stats['player1_win_rate']:.2%} | "
                       f"Mean Length: {eval_stats['mean_episode_length']:.1f}\n")
-                
-                # Save best model
                 if eval_stats['player0_win_rate'] > self.best_win_rate:
                     self.best_win_rate = eval_stats['player0_win_rate']
                     self.save(os.path.join(self.config.save_dir, "best_model.pt"))
-
                 self._call_hooks_eval(eval_stats)
-            
-            # Save checkpoint
-            if update_count % self.config.save_interval == 0:
+
+            if self.is_main and update_count % self.config.save_interval == 0:
                 self.save(os.path.join(self.config.save_dir, "latest.pt"))
 
-        # Final save
-        self.save(os.path.join(self.config.save_dir, "latest.pt"))
-        print(f"\nTraining complete! Model saved to {self.config.save_dir}/latest.pt")
-        self._call_hooks_end()
+            # Collective stop decision (gts identical on all ranks) → no rank
+            # leaves the loop early while others wait on the next all_reduce.
+            if gts >= self.config.total_timesteps:
+                break
 
-        # Save training log
-        log_path = os.path.join(
-            self.config.log_dir,
-            f"training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        )
-        with open(log_path, 'w') as f:
-            json.dump({
-                "config": self.config.to_dict(),
-                "final_timesteps": self.timesteps,
-                "final_episodes": self.episodes,
-                "final_updates": self.updates,
-                "episode_rewards": self.episode_rewards[-1000:],  # Last 1000
-                "losses": {k: v[-1000:] for k, v in self.losses.items()}
-            }, f, indent=2, default=float)  # default=float coerces numpy float32/64
-        print(f"Training log saved to {log_path}")
+        # Final: barrier so all ranks finish before rank-0 writes.
+        if self.world_size > 1:
+            dist.barrier()
+        if self.is_main:
+            self.save(os.path.join(self.config.save_dir, "latest.pt"))
+            print(f"\nTraining complete! Model saved to {self.config.save_dir}/latest.pt")
+            self._call_hooks_end()
+            log_path = os.path.join(
+                self.config.log_dir,
+                f"training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            )
+            with open(log_path, 'w') as f:
+                json.dump({
+                    "config": self.config.to_dict(),
+                    "final_timesteps": gts,
+                    "final_episodes": self.world_size * self.episodes,
+                    "final_updates": self.updates,
+                    "episode_rewards": self.episode_rewards[-1000:],
+                    "losses": {k: v[-1000:] for k, v in self.losses.items()}
+                }, f, indent=2, default=float)
+            print(f"Training log saved to {log_path}")

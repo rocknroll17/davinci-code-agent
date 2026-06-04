@@ -99,6 +99,7 @@ class ExperimentConfig:
         }
         _bool_fields = {
             "reset_optimizer_on_load", "monotone_reward", "zero_init",
+            "fp16", "compile",
         }
 
         unknown = sorted(k for k in d if k not in valid_fields)

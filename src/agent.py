@@ -82,13 +82,17 @@ class ModelAgent:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Checkpoint not found: {path}")
 
-        checkpoint = torch.load(path, map_location=device)
+        # weights_only=False: our own training checkpoints are trusted and may
+        # contain numpy scalars (e.g. best_mean_reward) that the 2.6+ safe loader rejects.
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
         # Prefer the architecture recorded in the checkpoint's config (added by the
         # experiment runner) so heads/layers variants load with the right shape.
         cfg = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
-        hidden_dim = cfg.get("hidden_dim", hidden_dim)
-        n_heads = cfg.get("n_heads", n_heads)
-        n_layers = cfg.get("n_layers", n_layers)
+        # `or` fallback so older checkpoints (pre-n_heads/n_layers, value missing or
+        # None) load with the original 4-head / 4-layer architecture.
+        hidden_dim = cfg.get("hidden_dim") or hidden_dim
+        n_heads = cfg.get("n_heads") or n_heads
+        n_layers = cfg.get("n_layers") or n_layers
         policy = DaVinciCodePolicy(hidden_dim=hidden_dim, n_heads=n_heads, n_layers=n_layers).to(device)
 
         state_dict = checkpoint.get("policy_state_dict", checkpoint)
