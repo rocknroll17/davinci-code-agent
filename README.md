@@ -99,7 +99,7 @@ pip install -r requirements.txt
 python main.py
 python main.py --no-viz            # headless (servers/CI)
 python main.py --dashboard         # browser dashboard on :6006
-python main.py --finetune          # edge-case fine-tuning mode
+python main.py --reset-optimizer   # reset optimizer state on resume
 
 # Evaluate a checkpoint's win rate
 python eval.py --checkpoint checkpoints/best_model.pt --episodes 500 --device cuda
@@ -163,16 +163,18 @@ Defaults from `PPOConfig` in [`src/trainer.py`](src/trainer.py) (override via `s
 ## Repository layout
 
 ```
-main.py            Training entry point (--no-viz / --finetune / --dashboard)
-eval.py            Win-rate evaluation
-play.py            Watch the model play (Rich)
+main.py            Training entry point (--no-viz / --reset-optimizer / --dashboard)
+run_experiment.py  Single-GPU experiment runner   train_ddp.py  Multi-GPU (torchrun) trainer
+eval.py            Win-rate evaluation            play.py       Watch the model play (Rich)
+compare_experiments.py / arena_fast.py            Head-to-head arenas
 src/
   model.py         Transformer policy + belief module + phase-gated heads
   trainer.py       PPO trainer (GAE, losses, hooks)
   env.py           Gymnasium environment   vec_env.py  Vectorized self-play
   buffer.py        Rollout buffer          agent.py    Inference wrapper
-  hooks.py         Training monitors       eval_suite.py / trajectory.py / builders.py
-  experiment_config.py                     visualizer.py  Rich TUI
+  runner.py        Single-game loop        episode.py  Retroactive-reward episode
+  hooks.py         Training monitors       eval_suite.py  Deep eval metrics
+  reward_config.py / interfaces.py         visualizer.py  Rich TUI
   dashboard/       Live web dashboard      docs/model.md  Model spec
   deck.py hand.py player.py phase.py constants.py  cards/  result/  utils/
 checkpoints/       Saved models (gitignored)    logs/  Training logs

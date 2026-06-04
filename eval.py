@@ -18,7 +18,6 @@ def main():
     config = PPOConfig()
     # For evaluation we only need 1 environment
     config.n_envs = 1
-    config.n_steps = 1
 
     device = torch.device(args.device) if args.device else None
 

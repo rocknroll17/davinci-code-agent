@@ -231,18 +231,6 @@ class DaVinciVisualizer:
     
     def _set_action_text(self, current_player: int, phase: str, action: np.ndarray, result: Optional['Result'] = None):
         """액션 텍스트 설정."""
-        # player_str = "YOU: " if current_player == 0 else "OPP: "
-        # if phase == "DRAW":
-        #     color = "BLACK" if action[0] == 0 else "WHITE"
-        #     self.last_action = f"Drew {color} card"
-        # elif phase == "GUESS":
-        #     self.last_action = f"Guess pos={action[1]} val={action[2]}"
-        # elif phase == "DECISION":
-        #     decision = "CONTINUE" if action[3] == 1 else "STOP"
-        #     self.last_action = f"Decision: {decision}"
-        # else:
-        #     self.last_action = str(action)
-        # self.last_action = player_str + self.last_action
         self.last_action = str(result) if result else "Problem in Result"
     
     def update_training_stats(self, mean_reward: float, policy_loss: float, value_loss: float):

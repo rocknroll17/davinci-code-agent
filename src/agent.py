@@ -105,13 +105,6 @@ class ModelAgent:
         agent._timesteps = checkpoint.get("timesteps", None)
         return agent
 
-    @classmethod
-    def from_trainer(cls, trainer) -> "ModelAgent":
-        """
-        Borrow the policy from a live ``PPOTrainer`` (no copy — shares weights).
-        """
-        return cls(trainer.policy, trainer.device)
-
     # ------------------------------------------------------------------
     # Single-step inference
     # ------------------------------------------------------------------
@@ -183,60 +176,6 @@ class ModelAgent:
             actions, _, _ = self.policy.get_action(obs_t, mask_t, deterministic=deterministic)
 
         return actions
-
-    # ------------------------------------------------------------------
-    # Logits / probability inspection
-    # ------------------------------------------------------------------
-
-    def logits(
-        self,
-        obs: Dict[str, np.ndarray],
-        action_mask: Optional[Dict[str, np.ndarray]] = None,
-    ) -> Dict[str, np.ndarray]:
-        """
-        Return **raw logits** for each action head (no masking applied).
-
-        Useful for debugging policy confidence and bias analysis.
-
-        Returns
-        -------
-        dict[str, np.ndarray]
-            Keys: ``"color"``, ``"position"``, ``"value"``, ``"decision"``
-        """
-        obs_t = obs_to_tensor(obs, self.device)
-
-        with torch.no_grad():
-            action_logits, _, _ = self.policy.forward(obs_t, action_mask=None)
-
-        return {k: v.cpu().numpy()[0] for k, v in action_logits.items()}
-
-    def probs(
-        self,
-        obs: Dict[str, np.ndarray],
-        action_mask: Optional[Dict[str, np.ndarray]] = None,
-    ) -> Dict[str, np.ndarray]:
-        """
-        Return softmax probabilities for each action head.
-
-        Returns
-        -------
-        dict[str, np.ndarray]  — same keys as ``logits()``
-        """
-        import torch.nn.functional as F
-        raw = self.logits(obs, action_mask)
-        return {k: F.softmax(torch.tensor(v), dim=-1).numpy() for k, v in raw.items()}
-
-    # ------------------------------------------------------------------
-    # Value estimate
-    # ------------------------------------------------------------------
-
-    def value(self, obs: Dict[str, np.ndarray]) -> float:
-        """Return the value-head estimate for a single obs."""
-        obs_t = obs_to_tensor(obs, self.device)
-        with torch.no_grad():
-            features, _, _ = self.policy.encoder(obs_t)
-            v = self.policy.value_head(features)
-        return float(v.cpu().item())
 
     # ------------------------------------------------------------------
     # Convenience

@@ -3,23 +3,15 @@ EvalSuite — deep evaluation metrics for DaVinci Code policy.
 
 Usage
 -----
-Single-model eval
-~~~~~~~~~~~~~~~~~
 from src.eval_suite import EvalSuite
 
+# from a live trainer:
 report = EvalSuite.run(trainer, n_episodes=200)
-print(report)
+# or from a loaded agent / policy:
+report = EvalSuite.run_agent(agent, n_episodes=200)
+report = EvalSuite.run_policy(policy, device, n_episodes=200)
 
-Compare two checkpoints
-~~~~~~~~~~~~~~~~~~~~~~~
-from src.agent import ModelAgent
-from src.eval_suite import EvalSuite
-
-a = ModelAgent.from_checkpoint("checkpoints/before.pt")
-b = ModelAgent.from_checkpoint("checkpoints/after.pt")
-r_a = EvalSuite.run_agent(a, n_episodes=200)
-r_b = EvalSuite.run_agent(b, n_episodes=200)
-print(r_b.compare(r_a))
+print(report.win_rate_p0, report.guess_accuracy, report.belief_accuracy)
 """
 
 from __future__ import annotations
@@ -154,65 +146,6 @@ class EvalReport:
             t = self.guess_total_by_pos[p]
             out[p] = self.guess_correct_by_pos[p] / t if t > 0 else None
         return out
-
-    # ------------------------------------------------------------------
-    # Comparison
-    # ------------------------------------------------------------------
-
-    def compare(self, baseline: "EvalReport") -> Dict[str, Any]:
-        """Return a dictionary of deltas vs *baseline* (self - baseline)."""
-        def _delta(a, b):
-            if a is None or b is None:
-                return None
-            return round(a - b, 4)
-
-        return {
-            "win_rate_p0":         _delta(self.win_rate_p0,         baseline.win_rate_p0),
-            "win_rate_p1":         _delta(self.win_rate_p1,         baseline.win_rate_p1),
-            "mean_episode_length": _delta(self.mean_episode_length, baseline.mean_episode_length),
-            "mean_reward_p0":      _delta(self.mean_reward_p0,      baseline.mean_reward_p0),
-            "guess_accuracy":      _delta(self.guess_accuracy,      baseline.guess_accuracy),
-            "joker_accuracy":      _delta(self.joker_accuracy,      baseline.joker_accuracy),
-            "invalid_action_rate": _delta(self.invalid_action_rate, baseline.invalid_action_rate),
-            "mean_streak_length":  _delta(self.mean_streak_length,  baseline.mean_streak_length),
-            "belief_accuracy":     _delta(self.belief_accuracy,     baseline.belief_accuracy),
-        }
-
-    def to_dict(self) -> dict:
-        return {
-            "n_episodes":           self.n_episodes,
-            "win_rate_p0":          self.win_rate_p0,
-            "win_rate_p1":          self.win_rate_p1,
-            "draw_rate":            self.draw_rate,
-            "mean_episode_length":  self.mean_episode_length,
-            "mean_reward_p0":       self.mean_reward_p0,
-            "mean_reward_p1":       self.mean_reward_p1,
-            "guess_accuracy":       self.guess_accuracy,
-            "joker_accuracy":       self.joker_accuracy,
-            "accuracy_by_value":    {str(k): v for k, v in self.accuracy_by_value.items() if v is not None},
-            "accuracy_by_position": {str(k): v for k, v in self.accuracy_by_position.items() if v is not None},
-            "invalid_action_rate":  self.invalid_action_rate,
-            "mean_streak_length":   self.mean_streak_length,
-            "belief_accuracy":      self.belief_accuracy,
-            "color_dist":           self.color_dist,
-            "value_dist":           self.value_dist,
-            "decision_dist":        self.decision_dist,
-            "position_dist":        self.position_dist,
-        }
-
-    def __str__(self) -> str:
-        ba = f"{self.belief_accuracy:.3f}" if self.belief_accuracy is not None else "N/A"
-        return (
-            f"EvalReport ({self.n_episodes} episodes)\n"
-            f"  Win rates  — P0: {self.win_rate_p0:.1%}  P1: {self.win_rate_p1:.1%}  Draw: {self.draw_rate:.1%}\n"
-            f"  Rewards    — P0: {self.mean_reward_p0:+.3f}  P1: {self.mean_reward_p1:+.3f}\n"
-            f"  Length     — mean {self.mean_episode_length:.1f} steps\n"
-            f"  Guess      — overall {self.guess_accuracy:.1%}  joker {self.joker_accuracy:.1%}"
-            f"  ({self.guess_correct}/{self.guess_total})\n"
-            f"  Streak     — mean {self.mean_streak_length:.2f}\n"
-            f"  Belief acc — {ba}\n"
-            f"  Invalid    — {self.invalid_action_rate:.2%}\n"
-        )
 
 
 # ---------------------------------------------------------------------------
