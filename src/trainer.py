@@ -759,10 +759,16 @@ class PPOTrainer:
                 f"checkpoint_{self.timesteps}.pt"
             )
         
+        # Strip torch.compile's "_orig_mod." wrapper from keys so checkpoints are
+        # portable between compiled and non-compiled runs (otherwise a compiled
+        # run's keys won't match a plain model on resume → silent re-init).
+        policy_state = {k.replace("._orig_mod.", "."): v
+                        for k, v in self.policy.state_dict().items()}
+
         # Store GLOBAL counts so a checkpoint resumes consistently regardless of
         # the world_size it was trained / is resumed with.
         torch.save({
-            "policy_state_dict": self.policy.state_dict(),
+            "policy_state_dict": policy_state,
             "optimizer_state_dict": self.optimizer.state_dict(),
             "timesteps": self.world_size * self.timesteps,
             "episodes": self.world_size * self.episodes,
@@ -781,14 +787,29 @@ class PPOTrainer:
         """
         checkpoint = torch.load(path, map_location=self.device)
 
+        # Normalize torch.compile's "_orig_mod." wrapper on BOTH sides so a
+        # checkpoint loads regardless of whether either it or the current model
+        # was compiled. We match on normalized names, then write into the real
+        # (possibly-prefixed) model keys.
+        def _norm(k: str) -> str:
+            return k.replace("._orig_mod.", ".")
+
+        saved_state = {_norm(k): v for k, v in checkpoint["policy_state_dict"].items()}
+        model_state = self.policy.state_dict()
+        norm_to_real = {_norm(k): k for k in model_state}
+
         # Filter out keys whose shape changed (e.g., belief_head after architecture update)
         # strict=False only handles missing/unexpected keys, not shape mismatches
-        saved_state = checkpoint["policy_state_dict"]
-        model_state = self.policy.state_dict()
-        compatible = {k: v for k, v in saved_state.items()
-                      if k in model_state and v.shape == model_state[k].shape}
-        shape_mismatch = [k for k, v in saved_state.items()
-                          if k in model_state and v.shape != model_state[k].shape]
+        compatible = {}
+        shape_mismatch = []
+        for nk, v in saved_state.items():
+            rk = norm_to_real.get(nk)
+            if rk is None:
+                continue
+            if v.shape == model_state[rk].shape:
+                compatible[rk] = v
+            else:
+                shape_mismatch.append(rk)
         if shape_mismatch:
             print(f"Shape mismatch — re-initialized: {shape_mismatch}")
 

@@ -16,10 +16,13 @@ NWORKERS="${NWORKERS:-22}"
 BATCH="${BATCH:-8192}"
 
 mkdir -p "experiments/$EXP"
+# torch.compile (inductor) needs Python.h at gcc time; venv ships them under include/.
+export CPATH="$PWD/.venv/include/python3.10${CPATH:+:$CPATH}"
+COMPILE_FLAG="${COMPILE:+--compile}"   # COMPILE=1 to enable torch.compile
 PYTHONUNBUFFERED=1 nohup .venv/bin/torchrun --nproc_per_node="$NPROC" --standalone train_ddp.py \
     --exp "$EXP" --n-heads "$HEADS" --n-layers "$LAYERS" \
     --total-timesteps "$STEPS" --n-envs "$NENVS" --n-workers "$NWORKERS" \
-    --batch-size "$BATCH" --fp16 \
+    --batch-size "$BATCH" --fp16 $COMPILE_FLAG \
     > "experiments/$EXP/run.out" 2>&1 &
 echo "$!" > "experiments/$EXP/ddp.pid"
 echo "launched DDP training '$EXP' (${NPROC} GPU, h=$HEADS l=$LAYERS, ${STEPS} steps, fp16)"
