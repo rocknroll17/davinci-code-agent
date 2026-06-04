@@ -9,11 +9,11 @@ and prints a single dashboard in the terminal. Stdlib only.
     python scripts/watch_experiments.py --once     # print once and exit
     python scripts/watch_experiments.py -n 2       # refresh every 2s
 """
+import argparse
 import os
 import re
 import sys
 import time
-import argparse
 
 EXPS = ["baseline", "monotone", "heads", "layers"]  # default; overridden by auto-discovery
 TOTAL = 10_000_000  # overridden by --total
@@ -65,7 +65,6 @@ def snapshot(root):
         u = last_match(lines, UPD)
         ev = last_match(lines, EVAL)
         if not u:
-            alive = bool(lines)
             rows.append((e, None))
             continue
         ts = int(u.group(2).replace(",", ""))

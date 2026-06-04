@@ -6,7 +6,7 @@ from src.runner import run_episode
 
 
 def test_initial_deal_and_deck_count(env):
-    obs, info = env.reset()
+    env.reset()
     # 4 cards each, 26 - 8 = 18 left in deck
     assert env.players[0]._hand.size == 4
     assert env.players[1]._hand.size == 4
