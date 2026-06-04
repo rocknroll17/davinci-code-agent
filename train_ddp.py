@@ -117,7 +117,7 @@ def main() -> None:
     if os.path.exists(latest):
         trainer.load(latest)
         if rank == 0:
-            print(f"Resumed from global timestep {world_size * trainer.timesteps:,}")
+            print(f"Resumed from global timestep {trainer._last_global_timesteps:,}")
 
     try:
         trainer.train()

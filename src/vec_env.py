@@ -264,7 +264,7 @@ class VectorDaVinciEnv:
                  reward_config=None) -> None:
         self.n_envs = n_envs
         self.envs = [
-            DaVinciCodeEnv(seed=seed + i if seed else None, reward_config=reward_config)
+            DaVinciCodeEnv(seed=seed + i if seed is not None else None, reward_config=reward_config)
             for i in range(n_envs)
         ]
         

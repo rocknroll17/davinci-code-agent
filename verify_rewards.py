@@ -90,7 +90,6 @@ def audit_game(env, agent, device, gi):
                 order = reward - base - brk
                 exp = reward  # decode-and-confirm components instead of independent recompute
                 ok_order = abs(order) < EPS or abs(order - REWARD_GUESS_ORDER_VIOLATION) < EPS
-                ok = ok_order
                 note = (f"X wrong {fmt_card(val)} | base {base:+.1f}"
                         + (f" +break {brk:+.1f}" if brk else "")
                         + (f" +order {order:+.1f}" if abs(order) > EPS else "")
