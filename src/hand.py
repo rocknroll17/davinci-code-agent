@@ -1,9 +1,11 @@
 import random
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
-from src.cards.card import Card, OpponentCard
+
+from src.cards.card import Card
 from src.constants import MAX_HAND_SIZE, CardValue, Color
+
 
 class Hand(list[Card]):
     """
@@ -38,17 +40,7 @@ class Hand(list[Card]):
         
         self.insert(insert_pos, card)
         return insert_pos
-    
-    def add_pending_card(self, card: "Card", position: int) -> int:
-        """
-        Insert a card at an exact position without applying game-rule placement logic.
-        Used by the server when the player confirms a joker position.
-        Returns the index where the card was inserted.
-        """
-        self.last_drawn_card = card
-        self.insert(position, card)
-        return position
-    
+
     def get_valid_joker_positions(self) -> List[int]:
         """
         조커가 삽입될 수 있는 모든 유효한 위치 반환.
@@ -94,24 +86,6 @@ class Hand(list[Card]):
             self.add_card(joker)
 
         self.last_drawn_card = None
-
-    def _find_valid_positions(self, new_card: Card) -> list[int]:
-        """
-        새 카드가 들어갈 수 있는 모든 유효한 위치 찾기.
-        - 조커가 주변에 있으면 위치 제약 완화
-        - 오름차순, 같은 값이면 검정이 왼쪽
-        """
-        if new_card.is_joker:
-            # 조커는 0 ~ len(self) 모든 위치 가능
-            return list(range(len(self) + 1))
-        n = len(self)
-        if n == 0:
-            return [0]
-        valid = []
-        for pos in range(n + 1):
-            if self._is_valid_position(new_card, pos):
-                valid.append(pos)
-        return valid
 
     def _is_valid_position(self, new_card: Card, pos: int) -> bool:
         """새 카드가 pos 위치에 들어갈 수 있는지 확인"""
@@ -172,46 +146,12 @@ class Hand(list[Card]):
     def to_string(self) -> str:
         """String representation of the hand."""
         return ", ".join(card.to_string() for card in self)
-    
-    def to_opponent_view(self) -> "Hand":
-        """
-        상대방이 보는 내 손패 표현.
-        공개된 카드는 값과 색상, 숨겨진 카드는 "??"로 표시.
-        """
-        view = Hand()
-        last_drawn_view_card = None
-        for card in self:
-            if card.is_revealed:
-                view.append(card)
-                if card is self.last_drawn_card:
-                    last_drawn_view_card = card
-            else:
-                opp_card = OpponentCard(card)
-                view.append(opp_card)
-                if card is self.last_drawn_card:
-                    last_drawn_view_card = opp_card
-        view.last_drawn_card = last_drawn_view_card
-        return view
-    
+
     @property
     def size(self) -> int:
         """Number of cards in hand."""
         return len(self)
-    
-    def get_position(self, card: "Card") -> int:
-        """
-        Get the position of a specific card in hand.
-        
-        Args:
-            card: Card to find
-        Returns:
-            Index of the card, or -1 if not found
-        """
-        try:
-            return self.index(card)
-        except ValueError:
-            return -1
-    
+
     def get_card(self, position: int) -> Card | None:
         """
         Get card at specific position.
@@ -281,61 +221,3 @@ class Hand(list[Card]):
         idx = random.choice(hidden_indices)
         self[idx].is_revealed = True
         return idx
-        
-    # ============================================================
-    # The code below is for finetune to find specific conditions of deck
-    # ============================================================
-
-    def is_joker_between(self) -> Tuple[List[int], Optional[int]]:
-        """
-        Check if there's a hidden joker that is definitively identifiable.
-        
-        A joker's position can be confirmed when:
-        - Same numbered Black and White cards are both revealed
-        - All cards between them are jokers
-        - Returns indices of hidden jokers in that range
-        
-        Example:
-        ... B5(revealed) ??(hidden) W5(revealed) ...
-        -> The hidden card is definitely a joker
-            
-        Returns:
-            Tuple of (List of indices of hidden jokers, value of surrounding cards)
-            빈 리스트면 조커 확정 없음
-        """
-        n = len(self)
-        if n < 3:
-            return [], None
-        
-        # Find all revealed black number cards
-        for i, left in enumerate(self):
-            if not (left.is_revealed and left.is_number and left.color == Color.BLACK):
-                continue
-            
-            # Look for matching revealed white card with same value
-            for j in range(i + 2, n):
-                right = self[j]
-                
-                # Check if right is the matching white card
-                if not (right.is_revealed and right.is_number and 
-                        right.color == Color.WHITE and right.value == left.value):
-                    # If we hit a non-joker, stop searching further
-                    if not self[j].is_joker:
-                        break
-                    continue
-                
-                # Check if all cards between are jokers
-                middle_cards = self[i + 1:j]
-                if all(card.is_joker for card in middle_cards):
-                    # Return indices of hidden jokers and the surrounding value
-                    hidden_jokers = [
-                        i + 1 + idx
-                        for idx, card in enumerate(middle_cards) 
-                        if not card.is_revealed
-                    ]
-                    if hidden_jokers:
-                        return hidden_jokers, int(left.value)
-                break
-        
-        return [], None
-

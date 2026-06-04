@@ -1,5 +1,6 @@
-from .result import Result
 from ..cards.card import Card
+from .result import Result
+
 
 class DrawResult(Result):
     """Class representing a draw result in a game."""

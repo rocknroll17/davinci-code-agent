@@ -1,27 +1,28 @@
 """Da Vinci Code Gymnasium Environment."""
 
 import logging
-from typing import Any, Optional, SupportsFloat
-import numpy as np
+import os
+from typing import Any, Optional
+
 import gymnasium as gym
+import numpy as np
 from gymnasium import spaces
 
+from src.cards.card import Card
 from src.constants import (
-    Phase, Color, MAX_HAND_SIZE, NUM_VALUES,
-    INITIAL_HAND_SIZE_2P, REWARD_WIN, REWARD_GUESS_SUCCESS,
-    REWARD_JOKER_SUCCESS, REWARD_GUESS_FAIL, REWARD_STREAK_BONUS_MULTIPLIER,
-    REWARD_STREAK_BREAK, REWARD_INVALID_ACTION, REWARD_STOP_DECISION,
-    REWARD_STOP_WITH_DETERMINED, REWARD_STOP_WITH_NEAR_DETERMINED, REWARD_GUESS_ORDER_VIOLATION
+    INITIAL_HAND_SIZE_2P,
+    MAX_HAND_SIZE,
+    NUM_VALUES,
+    Color,
+    Phase,
 )
 from src.deck import Deck
-from src.hand import Hand
-from src.cards.card import Card
-from src.player import Player
-from src.result.guess_result import GuessResult
-from src.result.draw_result import DrawResult
-from src.result.result import Result
-from src.result.streak_result import StreakResult
 from src.phase import PhaseCycle
+from src.player import Player
+from src.result.draw_result import DrawResult
+from src.result.guess_result import GuessResult
+from src.result.streak_result import StreakResult
+from src.reward_config import RewardConfig
 
 logger = logging.getLogger(__name__)
 
@@ -58,18 +59,27 @@ class DaVinciCodeEnv(gym.Env):
         render_mode: Optional[str] = None,
         seed: Optional[int] = None,
         viewer: Optional[int] = VIEWER,
+        reward_config: Optional["RewardConfig"] = None,
     ) -> None:
         """
         Initialize the Da Vinci Code environment.
-        
+
         Args:
             render_mode: Rendering mode ("human" or "ansi")
             seed: Random seed for reproducibility
+            reward_config: Reward magnitudes. Defaults to RewardConfig() which
+                equals the historical constants — so behaviour is unchanged when
+                not supplied.
         """
         super().__init__()
-        
+
         self.render_mode = render_mode
         self._seed = seed
+        # Reward magnitudes (None → defaults identical to the old global constants).
+        self._rc = reward_config if reward_config is not None else RewardConfig()
+        # Monotone reward mode (set via env var so it propagates to forked workers):
+        # when on, the terminal win bonus is dropped so reward is purely per-guess.
+        self._monotone_reward = os.environ.get("DVC_MONOTONE_REWARD") == "1"
         # viewer: if set to 0 or 1, render() will always show that player's perspective
         # This does NOT change the observation returned by _get_observation (keeps agent behavior).
         self.viewer: Optional[int] = viewer
@@ -288,7 +298,7 @@ class DaVinciCodeEnv(gym.Env):
         # Draw card
         card = self._draw_card(color)
         if card is None:
-            return DrawResult(self._current_player, REWARD_INVALID_ACTION, None, None, is_invalid=True)
+            return DrawResult(self._current_player, self._rc.invalid_action, None, None, is_invalid=True)
         
         # Add to current player's hand
         position = self.players[self._current_player]._hand.add_card(card)
@@ -335,11 +345,11 @@ class DaVinciCodeEnv(gym.Env):
         
         # Validate position
         if position >= opponent_hand.size:
-            return GuessResult(self._current_player, REWARD_INVALID_ACTION, position, value, False, is_invalid=True)
-        
+            return GuessResult(self._current_player, self._rc.invalid_action, position, value, False, is_invalid=True)
+
         target_card = opponent_hand.get_card(position)
         if target_card is None or target_card.is_revealed:
-            return GuessResult(self._current_player, REWARD_INVALID_ACTION, position, value, False, is_invalid=True)
+            return GuessResult(self._current_player, self._rc.invalid_action, position, value, False, is_invalid=True)
         
         # Check guess result
         if target_card.value == value:
@@ -383,19 +393,21 @@ class DaVinciCodeEnv(gym.Env):
 
         # Calculate reward
         if target_card.is_joker:
-            reward = REWARD_JOKER_SUCCESS
+            reward = self._rc.joker_success
         else:
-            reward = REWARD_GUESS_SUCCESS
-        
+            reward = self._rc.guess_success
+
         # Streak bonus
         self._streak += 1
-        reward += REWARD_STREAK_BONUS_MULTIPLIER * self._streak
+        reward += self._rc.streak_bonus_multiplier * self._streak
         
         # Check win condition
         if self.players[opponent]._hand.all_revealed():
             self._done = True
             self._winner = self._current_player
-            reward += REWARD_WIN
+            # Monotone reward: no terminal win bonus, only the per-guess reward above.
+            if not self._monotone_reward:
+                reward += self._rc.win
             return reward
         
         return reward
@@ -412,7 +424,7 @@ class DaVinciCodeEnv(gym.Env):
         Returns:
             Reward value
         """
-        reward = REWARD_GUESS_FAIL
+        reward = self._rc.guess_fail
 
         opponent = 1 - self._current_player
         opponent_hand = self.players[opponent]._hand
@@ -441,11 +453,11 @@ class DaVinciCodeEnv(gym.Env):
                 if guessed_value > right_val or (guessed_value == right_val and hidden_color_val >= right_col):
                     out_of_range = True
             if out_of_range:
-                reward += REWARD_GUESS_ORDER_VIOLATION
+                reward += self._rc.guess_order_violation
 
         # Streak break penalty
         if self._streak > 0:
-            reward += REWARD_STREAK_BREAK
+            reward += self._rc.streak_break
         self._streak = 0
         index = self.players[self._current_player].guess_fail(position, guessed_value, card_color)
         self.players[opponent]._update_constraint_revealed(index)
@@ -467,7 +479,7 @@ class DaVinciCodeEnv(gym.Env):
 
         if decision == 0:  # STOP
             # 확정된 미공개 카드가 있는데 맞추지 않고 stop하면 페널티
-            from src.utils.game_logic import find_determined_cards, count_candidate_cards
+            from src.utils.game_logic import count_candidate_cards, find_determined_cards
             determined = find_determined_cards(
                 self.players[self._current_player]._hand,
                 self.players[1 - self._current_player]._hand
@@ -478,11 +490,11 @@ class DaVinciCodeEnv(gym.Env):
                 max_candidates=2
             ) - len(determined)  # 확정 제외한 near-determined 수
             near_determined = max(0, near_determined)
-            penalty = (len(determined) * REWARD_STOP_WITH_DETERMINED
-                       + near_determined * REWARD_STOP_WITH_NEAR_DETERMINED)
+            penalty = (len(determined) * self._rc.stop_with_determined
+                       + near_determined * self._rc.stop_with_near_determined)
             if determined:
                 logger.info(f"Player {self._current_player} stopped with {len(determined)} determined, {near_determined} near-determined card(s)")
-            reward = StreakResult(self._current_player, REWARD_STOP_DECISION + penalty, False, is_invalid=False)
+            reward = StreakResult(self._current_player, self._rc.stop_decision + penalty, False, is_invalid=False)
             self._phase.end_streak()
         else:  # CONTINUE
             reward = StreakResult(self._current_player, 0.0, True, is_invalid=False)

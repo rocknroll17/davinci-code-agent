@@ -23,12 +23,13 @@ logits = agent.logits(obs, action_mask)
 from __future__ import annotations
 
 import os
-import torch
-import numpy as np
 from typing import Dict, Optional, Tuple
 
-from src.model import DaVinciCodePolicy, obs_to_tensor, action_mask_to_tensor
+import numpy as np
+import torch
+
 from src.constants import ACTION_KEYS, CHECKPOINT_BEST
+from src.model import DaVinciCodePolicy, action_mask_to_tensor, obs_to_tensor
 
 
 class ModelAgent:
@@ -58,6 +59,8 @@ class ModelAgent:
         path: str = CHECKPOINT_BEST,
         device: Optional[torch.device] = None,
         hidden_dim: int = 512,
+        n_heads: int = 4,
+        n_layers: int = 4,
     ) -> "ModelAgent":
         """
         Load a ``ModelAgent`` directly from a ``.pt`` checkpoint file.
@@ -70,14 +73,27 @@ class ModelAgent:
             Target device (auto-detect if ``None``).
         hidden_dim : int
             Must match the saved model's hidden dimension.
+        n_heads, n_layers : int
+            Encoder transformer shape — must match the saved model. If the
+            checkpoint stored its config, these are auto-read from it.
         """
         device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         if not os.path.exists(path):
             raise FileNotFoundError(f"Checkpoint not found: {path}")
 
-        checkpoint = torch.load(path, map_location=device)
-        policy = DaVinciCodePolicy(hidden_dim=hidden_dim).to(device)
+        # weights_only=False: our own training checkpoints are trusted and may
+        # contain numpy scalars (e.g. best_mean_reward) that the 2.6+ safe loader rejects.
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
+        # Prefer the architecture recorded in the checkpoint's config (added by the
+        # experiment runner) so heads/layers variants load with the right shape.
+        cfg = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+        # `or` fallback so older checkpoints (pre-n_heads/n_layers, value missing or
+        # None) load with the original 4-head / 4-layer architecture.
+        hidden_dim = cfg.get("hidden_dim") or hidden_dim
+        n_heads = cfg.get("n_heads") or n_heads
+        n_layers = cfg.get("n_layers") or n_layers
+        policy = DaVinciCodePolicy(hidden_dim=hidden_dim, n_heads=n_heads, n_layers=n_layers).to(device)
 
         state_dict = checkpoint.get("policy_state_dict", checkpoint)
         # strict=False tolerates architecture additions (e.g. slot_pos_embed) when
@@ -88,13 +104,6 @@ class ModelAgent:
         agent._checkpoint_path = path
         agent._timesteps = checkpoint.get("timesteps", None)
         return agent
-
-    @classmethod
-    def from_trainer(cls, trainer) -> "ModelAgent":
-        """
-        Borrow the policy from a live ``PPOTrainer`` (no copy — shares weights).
-        """
-        return cls(trainer.policy, trainer.device)
 
     # ------------------------------------------------------------------
     # Single-step inference
@@ -167,60 +176,6 @@ class ModelAgent:
             actions, _, _ = self.policy.get_action(obs_t, mask_t, deterministic=deterministic)
 
         return actions
-
-    # ------------------------------------------------------------------
-    # Logits / probability inspection
-    # ------------------------------------------------------------------
-
-    def logits(
-        self,
-        obs: Dict[str, np.ndarray],
-        action_mask: Optional[Dict[str, np.ndarray]] = None,
-    ) -> Dict[str, np.ndarray]:
-        """
-        Return **raw logits** for each action head (no masking applied).
-
-        Useful for debugging policy confidence and bias analysis.
-
-        Returns
-        -------
-        dict[str, np.ndarray]
-            Keys: ``"color"``, ``"position"``, ``"value"``, ``"decision"``
-        """
-        obs_t = obs_to_tensor(obs, self.device)
-
-        with torch.no_grad():
-            action_logits, _, _ = self.policy.forward(obs_t, action_mask=None)
-
-        return {k: v.cpu().numpy()[0] for k, v in action_logits.items()}
-
-    def probs(
-        self,
-        obs: Dict[str, np.ndarray],
-        action_mask: Optional[Dict[str, np.ndarray]] = None,
-    ) -> Dict[str, np.ndarray]:
-        """
-        Return softmax probabilities for each action head.
-
-        Returns
-        -------
-        dict[str, np.ndarray]  — same keys as ``logits()``
-        """
-        import torch.nn.functional as F
-        raw = self.logits(obs, action_mask)
-        return {k: F.softmax(torch.tensor(v), dim=-1).numpy() for k, v in raw.items()}
-
-    # ------------------------------------------------------------------
-    # Value estimate
-    # ------------------------------------------------------------------
-
-    def value(self, obs: Dict[str, np.ndarray]) -> float:
-        """Return the value-head estimate for a single obs."""
-        obs_t = obs_to_tensor(obs, self.device)
-        with torch.no_grad():
-            features, _, _ = self.policy.encoder(obs_t)
-            v = self.policy.value_head(features)
-        return float(v.cpu().item())
 
     # ------------------------------------------------------------------
     # Convenience

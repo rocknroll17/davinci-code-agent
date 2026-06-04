@@ -4,10 +4,11 @@ Rollout Buffer for PPO Training.
 Stores trajectories from environment interactions for batch updates.
 """
 
-import torch
+from dataclasses import dataclass
+from typing import Dict, Generator, List, Optional
+
 import numpy as np
-from typing import Dict, List, Generator, Optional
-from dataclasses import dataclass, field
+import torch
 
 from src.constants import ACTION_KEYS
 

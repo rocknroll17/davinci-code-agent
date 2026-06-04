@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 
+
 class Result(ABC):
     """Abstract base class for representing the result of a game or operation."""
     def __init__(self, player_id: int, reward: float, is_invalid: bool = False) -> None:

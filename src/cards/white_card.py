@@ -1,5 +1,7 @@
 from src.constants import Color
+
 from .card import Card
+
 
 class WhiteCard(Card):
     """

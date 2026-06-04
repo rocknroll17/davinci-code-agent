@@ -18,10 +18,6 @@ class PhaseCycle:
         self._phase: Phase = start
 
     @property
-    def phase(self) -> Phase:
-        return self._phase
-    
-    @property
     def name(self) -> Phase:
         return self._phase.name
 

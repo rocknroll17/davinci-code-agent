@@ -6,114 +6,20 @@ Includes both thread-based (VectorDaVinciEnv) and multiprocessing-based
 (SubprocVecEnv) implementations.
 """
 
-import os
-import numpy as np
-import random as _random
 import multiprocessing as mp
-from typing import List, Tuple, Dict, Any, Optional
+import os
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+
 from src.env import DaVinciCodeEnv
-from src.result.result import Result
-from src.constants import CardValue, Phase
-
-
-# ============================================================
-# Standalone finetune case checker (used inside worker processes)
-# ============================================================
-def _check_single_env_finetune(env, policy_action):
-    """
-    Check a single environment for finetune-worthy cases.
-    Called BEFORE env.step() so env state reflects current observation.
-    
-    Args:
-        env: DaVinciCodeEnv instance
-        policy_action: (4,) numpy array [color, position, value, decision]
-    
-    Returns:
-        override dict or None
-    """
-    # Only check GUESS phase
-    if env._phase != Phase.GUESS:
-        return None
-    
-    INTERVENTION_PROB = 0.7
-    CORRECT_BONUS = 0.3
-    MISS_PENALTY = -1.0
-    IMPOSSIBLE_GUESS_PENALTY = -2.0
-    IMPOSSIBLE_SAMPLE_RATE = 0.15
-    
-    policy_pos = int(policy_action[1])
-    policy_val = int(policy_action[2])
-    
-    current_player = env._current_player
-    my_hand = env.players[current_player]._hand
-    opponent_idx = 1 - current_player
-    opponent_hand = env.players[opponent_idx]._hand
-    
-    opponent_cards = list(opponent_hand)
-    if policy_pos >= len(opponent_cards):
-        return None
-    
-    target_card = opponent_cards[policy_pos]
-    target_color = target_card.color
-    
-    # Case: Impossible guess
-    if policy_val != CardValue.JOKER:
-        my_same_color_values = {
-            card.value for card in my_hand
-            if not card.is_joker and card.color == target_color
-        }
-        opponent_revealed_same_color_values = {
-            card.value for card in opponent_hand
-            if card.is_revealed and not card.is_joker and card.color == target_color
-        }
-        impossible_values = my_same_color_values | opponent_revealed_same_color_values
-        
-        if policy_val in impossible_values:
-            if _random.random() > IMPOSSIBLE_SAMPLE_RATE:
-                return None
-            return {
-                'reward_bonus': IMPOSSIBLE_GUESS_PENALTY,
-                'case_type': 'impossible_guess'
-            }
-    
-    # Case: Joker detection
-    joker_positions, surrounding_value = opponent_hand.is_joker_between()
-    if not joker_positions:
-        return None
-    
-    is_correct_guess = (
-        policy_pos in joker_positions and
-        policy_val == CardValue.JOKER
-    )
-    
-    if is_correct_guess:
-        return {
-            'reward_bonus': CORRECT_BONUS,
-            'case_type': 'joker_correct',
-            'surrounding_value': surrounding_value
-        }
-    else:
-        if _random.random() < INTERVENTION_PROB:
-            target_pos = _random.choice(joker_positions)
-            custom_action = np.array([0, target_pos, CardValue.JOKER, 0], dtype=np.int64)
-            return {
-                'action': custom_action,
-                'reward_bonus': CORRECT_BONUS,
-                'case_type': 'joker_intervention',
-                'surrounding_value': surrounding_value
-            }
-        else:
-            return {
-                'reward_bonus': MISS_PENALTY,
-                'case_type': 'joker_miss'
-            }
 
 
 # ============================================================
 # Worker process function for SubprocVecEnv
 # ============================================================
-def _worker_loop(pipe, parent_pipe, n_local_envs, seed_base):
+def _worker_loop(pipe, parent_pipe, n_local_envs, seed_base, reward_config=None):
     """
     Main loop for a worker process.
     Each worker manages n_local_envs environments.
@@ -121,7 +27,7 @@ def _worker_loop(pipe, parent_pipe, n_local_envs, seed_base):
     parent_pipe.close()
     
     envs = [
-        DaVinciCodeEnv(seed=seed_base + i if seed_base is not None else None)
+        DaVinciCodeEnv(seed=seed_base + i if seed_base is not None else None, reward_config=reward_config)
         for i in range(n_local_envs)
     ]
     
@@ -157,53 +63,6 @@ def _worker_loop(pipe, parent_pipe, n_local_envs, seed_base):
             
             pipe.send((obs_list, rewards, terminated, truncated_arr, info_list, result_list))
         
-        elif cmd == 'step_finetune':
-            # Combined: finetune check + action override + step + reward override + auto-reset
-            actions = data  # (n_local, 4)
-            
-            obs_list = []
-            rewards = np.zeros(n_local_envs, dtype=np.float32)
-            terminated = np.zeros(n_local_envs, dtype=bool)
-            truncated_arr = np.zeros(n_local_envs, dtype=bool)
-            info_list = []
-            result_list = []
-            overrides = {}  # local_idx -> override dict
-            
-            for idx, (env, action) in enumerate(zip(envs, actions)):
-                # Finetune check BEFORE step
-                action_to_use = action
-                override = _check_single_env_finetune(env, action)
-                if override is not None:
-                    overrides[idx] = override
-                    if 'action' in override:
-                        action_to_use = override['action']
-                
-                # Step
-                o, _, r, te, tr, info, result = env.step(action_to_use)
-                
-                # Apply reward override
-                if idx in overrides:
-                    if 'reward' in overrides[idx]:
-                        r = overrides[idx]['reward']
-                    elif 'reward_bonus' in overrides[idx]:
-                        r += overrides[idx]['reward_bonus']
-                
-                # Auto-reset for done envs
-                if te or tr:
-                    info['_winner'] = env._winner
-                    reset_obs, reset_info = env.reset()
-                    info['_reset_obs'] = reset_obs
-                    info['_reset_info'] = reset_info
-                
-                obs_list.append(o)
-                rewards[idx] = r
-                terminated[idx] = te
-                truncated_arr[idx] = tr
-                info_list.append(info)
-                result_list.append(result)
-            
-            pipe.send((obs_list, rewards, terminated, truncated_arr, info_list, result_list, overrides))
-        
         elif cmd == 'reset':
             results = [env.reset() for env in envs]
             obs_list = [r[0] for r in results]
@@ -233,10 +92,11 @@ class SubprocVecEnv:
     - True parallelism for CPU-bound env.step()
     - O(n_envs / n_workers) per step instead of O(n_envs)
     - Auto-reset: done envs reset inside workers (no extra round-trip)
-    - step_finetune: finetune case check runs in parallel inside workers
     """
     
-    def __init__(self, n_envs: int = 2000, seed: Optional[int] = None, n_workers: Optional[int] = None) -> None:
+    def __init__(self, n_envs: int = 2000, seed: Optional[int] = None, n_workers: Optional[int] = None,
+                 reward_config=None) -> None:
+        self.reward_config = reward_config
         self.n_envs = n_envs
         self.n_workers = n_workers or min(os.cpu_count() * 2 or 4, max(1, n_envs // 30))
         self.n_workers = max(1, min(self.n_workers, n_envs))
@@ -267,7 +127,7 @@ class SubprocVecEnv:
             
             worker = ctx.Process(
                 target=_worker_loop,
-                args=(child_conn, parent_conn, n_local, worker_seed),
+                args=(child_conn, parent_conn, n_local, worker_seed, reward_config),
                 daemon=True
             )
             worker.start()
@@ -278,7 +138,7 @@ class SubprocVecEnv:
             seed_offset += n_local
         
         # Local env for visualization only (not used in training)
-        self._viz_env = DaVinciCodeEnv(seed=seed if seed is not None else None)
+        self._viz_env = DaVinciCodeEnv(seed=seed if seed is not None else None, reward_config=reward_config)
         
         print(f"SubprocVecEnv: {n_envs} envs across {self.n_workers} workers "
               f"({self.envs_per_worker[0]}-{self.envs_per_worker[-1]} envs/worker)")
@@ -336,55 +196,6 @@ class SubprocVecEnv:
             np.concatenate(all_truncated),
             all_infos,
             all_results
-        )
-    
-    def step_finetune(
-        self,
-        actions: np.ndarray
-    ) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray, List[Dict], List, Dict[int, Dict]]:
-        """
-        Step all environments with finetune case detection (parallel).
-        
-        - Finetune checks run inside workers (no env state serialization needed)
-        - Action/reward overrides applied inside workers
-        - Returns global override map for stats tracking
-        """
-        # Send actions to each worker
-        for w in range(self.n_workers):
-            start = self.worker_offsets[w]
-            end = self.worker_offsets[w + 1]
-            self.pipes[w].send(('step_finetune', actions[start:end]))
-        
-        all_obs = []
-        all_rewards = []
-        all_terminated = []
-        all_truncated = []
-        all_infos = []
-        all_results = []
-        global_overrides = {}  # global_env_idx -> override
-        
-        for w, pipe in enumerate(self.pipes):
-            obs_list, rewards, terminated, truncated_arr, info_list, result_list, local_overrides = pipe.recv()
-            all_obs.extend(obs_list)
-            all_rewards.append(rewards)
-            all_terminated.append(terminated)
-            all_truncated.append(truncated_arr)
-            all_infos.extend(info_list)
-            all_results.extend(result_list)
-            
-            # Map local override indices to global
-            offset = self.worker_offsets[w]
-            for local_idx, override in local_overrides.items():
-                global_overrides[offset + local_idx] = override
-        
-        return (
-            self._batch_obs(all_obs),
-            np.concatenate(all_rewards),
-            np.concatenate(all_terminated),
-            np.concatenate(all_truncated),
-            all_infos,
-            all_results,
-            global_overrides
         )
     
     def get_action_masks(self) -> Dict[str, np.ndarray]:
@@ -449,10 +260,11 @@ class VectorDaVinciEnv:
     use SubprocVecEnv for true CPU parallelism.
     """
     
-    def __init__(self, n_envs: int = 8, seed: Optional[int] = None, use_threads: bool = True) -> None:
+    def __init__(self, n_envs: int = 8, seed: Optional[int] = None, use_threads: bool = True,
+                 reward_config=None) -> None:
         self.n_envs = n_envs
         self.envs = [
-            DaVinciCodeEnv(seed=seed + i if seed else None)
+            DaVinciCodeEnv(seed=seed + i if seed else None, reward_config=reward_config)
             for i in range(n_envs)
         ]
         

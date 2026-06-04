@@ -133,7 +133,7 @@ class DashboardServer:
 
     def _build_app(self):
         from fastapi import FastAPI
-        from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+        from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
         from fastapi.staticfiles import StaticFiles
 
         app = FastAPI(title="DaVinci Training Dashboard", docs_url=None, redoc_url=None)
