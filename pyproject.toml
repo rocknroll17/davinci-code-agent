@@ -1,5 +1,8 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Put the repo root on sys.path so `import src...` resolves under a bare `pytest`
+# invocation (CI), not just `python -m pytest` (which adds CWD automatically).
+pythonpath = ["."]
 addopts = "-q"
 filterwarnings = [
     # benign torch note: TransformerEncoder nested-tensor + norm_first=True
