@@ -122,6 +122,11 @@ class PPOTrainer:
         self.rank = rank
         self.world_size = world_size
         self.is_main = (rank == 0)
+        if self.world_size > 1 and not dist.is_initialized():
+            raise RuntimeError(
+                "world_size>1 requires torch.distributed to be initialized "
+                "(call dist.init_process_group() before constructing PPOTrainer)."
+            )
 
         # Initialize policy network
         self.policy = DaVinciCodePolicy(
@@ -131,8 +136,11 @@ class PPOTrainer:
             zero_init=config.zero_init,
         ).to(self.device)
 
-        # Mixed precision (fp16 + GradScaler). Disabled => no-op.
-        self.scaler = torch.amp.GradScaler("cuda", enabled=config.fp16)
+        # Mixed precision (fp16 + GradScaler). fp16 is CUDA-only (Turing → fp16),
+        # so gate it on the actual device — keeps CPU runs (CI smoke) safe even if
+        # --fp16 is set by mistake.
+        self._fp16 = config.fp16 and self.device.type == "cuda"
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self._fp16)
 
         # Optional: compile the encoder (forward is branch-free; get_action has
         # data-dependent .any() branches so we leave it uncompiled).
@@ -184,6 +192,10 @@ class PPOTrainer:
         self.timesteps = 0
         self.episodes = 0
         self.updates = 0
+        # True global timestep count (collective SUM across ranks), kept up to date
+        # in train() and on load() so checkpoints/logs report accurate totals even
+        # when per-rank timestep counts diverge (variable episode lengths).
+        self._last_global_timesteps = 0
         self.best_win_rate = 0.0
         
         # Logging
@@ -271,7 +283,7 @@ class PPOTrainer:
             obs_tensor = self._batch_obs_to_tensor(obs)
             action_mask_tensor = self._batch_mask_to_tensor(action_masks_np)
 
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16, enabled=self.config.fp16):
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16, enabled=self._fp16):
                 actions, log_probs, values = self.policy.get_action(obs_tensor, action_mask_tensor)
 
             next_obs, rewards, terminated, truncated, next_infos, results = self.vec_env.step(actions)
@@ -331,7 +343,7 @@ class PPOTrainer:
         log_probs_np_all: Dict[str, np.ndarray],
         values_np_all: np.ndarray,
         action_masks_np: Dict[str, np.ndarray],
-        per_env_tracking: List[Dict],
+        per_env_tracking: List["Episode"],
         episode_rewards: np.ndarray,
         episode_lengths: np.ndarray,
     ) -> int:
@@ -375,7 +387,7 @@ class PPOTrainer:
         i: int,
         obs: Dict[str, np.ndarray],
         next_obs: Dict[str, np.ndarray],
-        per_env_tracking: List[Dict],
+        per_env_tracking: List["Episode"],
         episode_rewards: np.ndarray,
         episode_lengths: np.ndarray,
         completed_rewards: List[float],
@@ -500,14 +512,14 @@ class PPOTrainer:
                 if bi >= n_minibatches:
                     break  # keep all ranks at the same #minibatches (DDP collective match)
                 # Evaluate current policy on batch (heavy forward in fp16 under autocast).
-                with torch.autocast("cuda", dtype=torch.float16, enabled=self.config.fp16):
+                with torch.autocast("cuda", dtype=torch.float16, enabled=self._fp16):
                     log_probs, values, entropies, belief_logits = self.policy.evaluate_actions(
                         batch["obs"],
                         batch["actions"],
                         batch["action_mask"]
                     )
                 # Upcast outputs to fp32 so the (cheap) loss math is numerically stable.
-                if self.config.fp16:
+                if self._fp16:
                     values = values.float()
                     belief_logits = belief_logits.float()
                     log_probs = {k: v.float() for k, v in log_probs.items()}
@@ -766,11 +778,15 @@ class PPOTrainer:
                         for k, v in self.policy.state_dict().items()}
 
         # Store GLOBAL counts so a checkpoint resumes consistently regardless of
-        # the world_size it was trained / is resumed with.
+        # the world_size it was trained / is resumed with. Prefer the true
+        # collective sum (set in train()); fall back to world_size*local only if
+        # save() runs before any update. Episodes are identical across ranks
+        # (episodes_per_update each), so world_size*local is exact for them.
+        global_timesteps = self._last_global_timesteps or (self.world_size * self.timesteps)
         torch.save({
             "policy_state_dict": policy_state,
             "optimizer_state_dict": self.optimizer.state_dict(),
-            "timesteps": self.world_size * self.timesteps,
+            "timesteps": global_timesteps,
             "episodes": self.world_size * self.episodes,
             "updates": self.updates,
             "config": self.config.to_dict()
@@ -830,9 +846,13 @@ class PPOTrainer:
             except (ValueError, KeyError) as e:
                 print(f"⚠️ Optimizer load failed ({e}), keeping current optimizer state")
         
-        # Checkpoints store GLOBAL counts → back to per-rank local.
-        self.timesteps = checkpoint["timesteps"] // self.world_size
-        self.episodes = checkpoint["episodes"] // self.world_size
+        # Checkpoints store GLOBAL counts → back to per-rank local. Distribute the
+        # timestep remainder across the lowest ranks so SUM(local) == stored global.
+        g_ts = int(checkpoint["timesteps"])
+        base, rem = divmod(g_ts, max(1, self.world_size))
+        self.timesteps = base + (1 if self.rank < rem else 0)
+        self._last_global_timesteps = g_ts
+        self.episodes = int(checkpoint["episodes"]) // self.world_size
         self.updates = checkpoint["updates"]
         
         # Always apply config LR (checkpoint may have old LR)
@@ -887,6 +907,7 @@ class PPOTrainer:
             update_stats = self.update()
             update_count += 1
             gts = self._global_timesteps()   # collective; identical on all ranks
+            self._last_global_timesteps = gts  # accurate global count for save()/logs
 
             # Step LR scheduler
             self.scheduler.step()
