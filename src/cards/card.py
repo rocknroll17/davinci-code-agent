@@ -53,18 +53,7 @@ class Card(ABC):
     def is_number(self) -> bool:
         """Check if this card is a numbered card (not a joker)."""
         return self.value != CardValue.JOKER
-    
-    def sort_key(self) -> tuple[int, int]:
-        """
-        Return sort key for hand ordering.
-        
-        Cards are sorted by value first, then by color (black before white).
-        
-        Returns:
-            Tuple of (value, color) for sorting
-        """
-        return (self.value, self.color)
-    
+
     def to_observation(self, hidden: bool = False) -> list[int]:
         """
         Convert card to observation format.
@@ -93,14 +82,8 @@ class Card(ABC):
     def to_string(self) -> str:
         """String representation of the card."""
         return f"{self.color.to_string()} {self.value.to_string()}"
-    
-    def to_ui_string(self) -> str:
-        """String representation for UI display."""
-        color = "검정" if self.color == Color.BLACK else "하양"
-        if self.is_joker:
-            return f"{color} Joker"
-        return f"{color} {self.value.to_string()}"
-    
+
+
 class OpponentCard(Card):
     """
     Represents a card from opponent's perspective.
