@@ -92,12 +92,13 @@ class ExperimentConfig:
         }
         _int_fields = {
             "total_timesteps", "n_envs", "episodes_per_update",
-            "batch_size", "n_epochs", "hidden_dim",
+            "batch_size", "n_epochs", "hidden_dim", "n_heads", "n_layers",
+            "n_workers",
             "log_interval", "save_interval", "eval_interval",
             "n_eval_episodes",
         }
         _bool_fields = {
-            "finetune", "freeze_value_on_finetune", "reset_optimizer_on_load",
+            "reset_optimizer_on_load", "monotone_reward", "zero_init",
         }
 
         unknown = sorted(k for k in d if k not in valid_fields)
@@ -118,6 +119,9 @@ class ExperimentConfig:
                 val = int(val)
             elif key in _bool_fields:
                 val = bool(val)
+            elif key == "reward_config" and isinstance(val, dict):
+                from src.reward_config import RewardConfig
+                val = RewardConfig(**val)
             kwargs[key] = val
 
         return PPOConfig(**kwargs)

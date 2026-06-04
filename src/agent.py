@@ -58,6 +58,8 @@ class ModelAgent:
         path: str = CHECKPOINT_BEST,
         device: Optional[torch.device] = None,
         hidden_dim: int = 512,
+        n_heads: int = 4,
+        n_layers: int = 4,
     ) -> "ModelAgent":
         """
         Load a ``ModelAgent`` directly from a ``.pt`` checkpoint file.
@@ -70,6 +72,9 @@ class ModelAgent:
             Target device (auto-detect if ``None``).
         hidden_dim : int
             Must match the saved model's hidden dimension.
+        n_heads, n_layers : int
+            Encoder transformer shape — must match the saved model. If the
+            checkpoint stored its config, these are auto-read from it.
         """
         device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -77,7 +82,13 @@ class ModelAgent:
             raise FileNotFoundError(f"Checkpoint not found: {path}")
 
         checkpoint = torch.load(path, map_location=device)
-        policy = DaVinciCodePolicy(hidden_dim=hidden_dim).to(device)
+        # Prefer the architecture recorded in the checkpoint's config (added by the
+        # experiment runner) so heads/layers variants load with the right shape.
+        cfg = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+        hidden_dim = cfg.get("hidden_dim", hidden_dim)
+        n_heads = cfg.get("n_heads", n_heads)
+        n_layers = cfg.get("n_layers", n_layers)
+        policy = DaVinciCodePolicy(hidden_dim=hidden_dim, n_heads=n_heads, n_layers=n_layers).to(device)
 
         state_dict = checkpoint.get("policy_state_dict", checkpoint)
         # strict=False tolerates architecture additions (e.g. slot_pos_embed) when

@@ -524,18 +524,25 @@ class DaVinciCodePolicy(nn.Module):
     - LayerNorm throughout for training stability
     """
     
-    def __init__(self, hidden_dim: int = 512) -> None:
+    def __init__(self, hidden_dim: int = 512, n_heads: int = 4, n_layers: int = 4,
+                 zero_init: bool = False) -> None:
         """
         Initialize the policy network.
-        
+
         Args:
             hidden_dim: Hidden layer dimension throughout the network
+            n_heads: Number of attention heads in the encoder transformer
+            n_layers: Number of transformer encoder layers
+            zero_init: If True, every default-initialized weight/bias starts at 0
+                       instead of orthogonal/normal. Explicitly designated inits
+                       (belief_to_opp_proj zeros, cls_token) are kept as-is.
         """
         super().__init__()
-        
+
         self.hidden_dim = hidden_dim
-        
-        self.encoder = ObservationEncoder(hidden_dim)
+        self._zero_init = zero_init
+
+        self.encoder = ObservationEncoder(hidden_dim, n_heads=n_heads, n_layers=n_layers)
         self.action_heads = PhaseGatedActionHead(hidden_dim)
         self.value_head = ValueHead(hidden_dim)
         
@@ -558,7 +565,18 @@ class DaVinciCodePolicy(nn.Module):
         nn.init.zeros_(self.belief_to_opp_proj.bias)
     
     def _init_weights(self, module: nn.Module) -> None:
-        """Initialize weights using orthogonal initialization."""
+        """Initialize weights.
+
+        Default: orthogonal (Linear/Conv) + normal(0, 0.02) (Embedding).
+        If ``self._zero_init``: every weight and bias starts at 0 instead — unless
+        a specific value is designated elsewhere (e.g. belief_to_opp_proj, cls_token).
+        """
+        if self._zero_init:
+            if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Embedding)):
+                nn.init.zeros_(module.weight)
+                if getattr(module, "bias", None) is not None:
+                    nn.init.zeros_(module.bias)
+            return
         if isinstance(module, nn.Linear):
             nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
             if module.bias is not None:

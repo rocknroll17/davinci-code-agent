@@ -269,57 +269,45 @@ class EvalSuite:
         seed: Optional[int] = None,
     ) -> EvalReport:
         """Run full evaluation and return an ``EvalReport``."""
+        from src.agent import ModelAgent
+        from src.runner import run_episode
+
         env = DaVinciCodeEnv(seed=seed)
         report = EvalReport(n_episodes=n_episodes)
+        agent = ModelAgent(policy, device)
 
         policy.eval()
         with torch.no_grad():
             for ep in range(n_episodes):
                 ep_seed = (seed + ep) if seed is not None else None
-                obs, info = env.reset(seed=ep_seed)
-                done = False
-                ep_rewards = [0.0, 0.0]
-                ep_length = 0
-                ep_max_streak = 0
+                ep_state = {"max_streak": 0}
 
-                while not done:
-                    current_player = info.get("current_player", 0)
-                    action_mask = env.get_action_mask()
-                    phase_idx = int(np.argmax(obs["phase"]))
+                def on_step(ctx, ep_state=ep_state):
+                    phase_idx = ctx.phase
+                    action_np = ctx.action
+                    result = ctx.result
 
-                    obs_t = obs_to_tensor(obs, device)
-                    mask_t = action_mask_to_tensor(action_mask, device)
-
-                    action, _lp, _v = policy.get_action(obs_t, mask_t, deterministic=True)
-                    action_np = action[0]   # scalar array shape (4,)
-
-                    # ── belief accuracy: compare prediction vs actual hidden values ──
-                    hidden_vals = info.get("hidden_values")
+                    # ── belief accuracy: prediction (from obs before move) vs hidden values ──
+                    hidden_vals = ctx.info_before.get("hidden_values")
                     if hidden_vals is not None:
-                        # Run encoder + belief head
+                        obs_t = obs_to_tensor(ctx.obs_before, device)
                         feats, _cp, opp_per_pos = policy.encoder(obs_t)
                         global_exp = feats.unsqueeze(1).expand(-1, MAX_HAND_SIZE, -1)
                         combined = torch.cat([global_exp, opp_per_pos], dim=-1)
                         belief_logits = policy.belief_head(combined)  # (1, 13, 13)
-                        predicted = belief_logits[0].argmax(dim=-1).cpu().numpy()  # (13,)
+                        predicted = belief_logits[0].argmax(dim=-1).cpu().numpy()
                         hidden_np = np.asarray(hidden_vals, dtype=np.int8)
                         visible_mask = hidden_np >= 0
                         if visible_mask.any():
-                            report.belief_total_positions  += int(visible_mask.sum())
+                            report.belief_total_positions += int(visible_mask.sum())
                             report.belief_correct_positions += int(
                                 (predicted[visible_mask] == hidden_np[visible_mask]).sum()
                             )
 
-                    next_obs, _, reward, terminated, truncated, next_info, result = env.step(action_np)
-                    done = terminated or truncated
-
-                    # ── collect per-step stats ──
                     report.total_steps += 1
-                    ep_rewards[current_player] += float(reward)
-                    ep_length += 1
 
-                    # action distributions
-                    color, pos, val, dec = int(action_np[0]), int(action_np[1]), int(action_np[2]), int(action_np[3])
+                    color, pos, val, dec = (int(action_np[0]), int(action_np[1]),
+                                            int(action_np[2]), int(action_np[3]))
                     if phase_idx == Phase.DRAW.value:
                         report.color_dist[color] += 1
                     elif phase_idx == Phase.GUESS.value:
@@ -328,53 +316,45 @@ class EvalSuite:
                     elif phase_idx == Phase.DECISION.value:
                         report.decision_dist[dec] += 1
 
-                    # validity
-                    if result is not None and hasattr(result, "is_invalid") and result.is_invalid:
+                    if result is not None and getattr(result, "is_invalid", False):
                         report.invalid_action_count += 1
 
-                    # guess accuracy
                     if phase_idx == Phase.GUESS.value and result is not None and hasattr(result, "is_correct"):
                         if not result.is_invalid:
                             report.guess_total += 1
                             correct = bool(result.is_correct)
                             if correct:
                                 report.guess_correct += 1
-                            # by target value
                             target_v = min(int(action_np[2]), 12)
                             report.guess_total_by_value[target_v] += 1
                             if correct:
                                 report.guess_correct_by_value[target_v] += 1
-                            # by target position
                             target_p = min(int(action_np[1]), 12)
                             report.guess_total_by_pos[target_p] += 1
                             if correct:
                                 report.guess_correct_by_pos[target_p] += 1
-                            # joker guesses
                             if val == CardValue.JOKER:
                                 report.joker_guess_total += 1
                                 if correct:
                                     report.joker_guess_correct += 1
 
-                    # streak
-                    streak = getattr(env, "_streak", 0)
-                    if streak > ep_max_streak:
-                        ep_max_streak = streak
+                    streak = getattr(ctx.env, "_streak", 0)
+                    if streak > ep_state["max_streak"]:
+                        ep_state["max_streak"] = streak
 
-                    obs, info = next_obs, next_info
+                res = run_episode(env, agent, deterministic=True, seed=ep_seed, on_step=on_step)
 
-                # ── end of episode ──
-                winner = next_info.get("winner")
-                if winner == 0:
+                if res.winner == 0:
                     report.player0_wins += 1
-                elif winner == 1:
+                elif res.winner == 1:
                     report.player1_wins += 1
                 else:
                     report.draws += 1
 
-                report.episode_lengths.append(ep_length)
-                report.episode_rewards_p0.append(ep_rewards[0])
-                report.episode_rewards_p1.append(ep_rewards[1])
-                report.streak_lengths.append(ep_max_streak)
+                report.episode_lengths.append(res.length)
+                report.episode_rewards_p0.append(res.rewards[0])
+                report.episode_rewards_p1.append(res.rewards[1])
+                report.streak_lengths.append(ep_state["max_streak"])
 
         policy.train()
         env.close()

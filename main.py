@@ -3,8 +3,7 @@
 Da Vinci Code Self-Play Training
 python main.py 실행하면 바로 학습 시작
 python main.py --no-viz 로 시각화 없이 학습
-python main.py --finetune 로 특수 케이스 파인튜닝 학습
-python main.py --reset-optimizer 로 optimizer 초기화 후 학습 (파인튜닝 후 일반학습 전환 시 사용)
+python main.py --reset-optimizer 로 optimizer 초기화 후 학습
 python main.py --dashboard 로 브라우저 대시보드 활성화 (기본: 포트 6006)
 python main.py --dashboard-port 8080 로 포트 변경
 """
@@ -25,7 +24,6 @@ CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "latest.pt")
 def main():
     # 옵션 파싱
     use_viz = "--no-viz" not in sys.argv
-    use_finetune = "--finetune" in sys.argv
     reset_optimizer = "--reset-optimizer" in sys.argv
     use_dashboard = "--dashboard" in sys.argv
 
@@ -40,7 +38,6 @@ def main():
     
     config = PPOConfig(
         save_dir=CHECKPOINT_DIR,
-        finetune=use_finetune,
         reset_optimizer_on_load=reset_optimizer
     )
     
@@ -53,8 +50,6 @@ def main():
     else:
         msg = "Starting fresh training"
     
-    # Finetune 모드 메시지
-    finetune_msg = "🎯 Finetune mode: ON (특수 케이스 학습)" if use_finetune else "Finetune mode: OFF"
     optimizer_msg = "🔄 Optimizer reset: ON" if reset_optimizer else ""
 
     # ── 대시보드 ──────────────────────────────────────────────────────────────
@@ -85,7 +80,6 @@ def main():
             viz.start()
             viz.add_log(msg)
             viz.add_log(f"Device: {device}")
-            viz.add_log(finetune_msg)
             if optimizer_msg:
                 viz.add_log(optimizer_msg)
             if use_dashboard:
@@ -97,7 +91,6 @@ def main():
     if not use_viz:
         print(f"Device: {device}")
         print(msg)
-        print(finetune_msg)
         if optimizer_msg:
             print(optimizer_msg)
     
