@@ -67,7 +67,8 @@ def run_episode(
     Returns:
         EpisodeResult(winner, length, [reward_p0, reward_p1]).
     """
-    two_agent = isinstance(agents, (list, tuple))
+    # Normalize to a per-player pair: a single agent plays both seats (self-play).
+    pair: Sequence[Agent] = agents if isinstance(agents, (list, tuple)) else (agents, agents)
 
     obs, info = env.reset(seed=seed) if seed is not None else env.reset()
     rewards = [0.0, 0.0]
@@ -76,7 +77,7 @@ def run_episode(
 
     while not done and length < max_steps:
         player = info.get("current_player", 0)
-        agent = agents[player] if two_agent else agents
+        agent = pair[player]
         mask = env.get_action_mask()
         action, _ = agent.act(obs, mask, deterministic=deterministic)
 

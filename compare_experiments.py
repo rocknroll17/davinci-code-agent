@@ -18,12 +18,11 @@ Usage:
     python compare_experiments.py --ckpt latest.pt      # use latest instead of best
 """
 
-import os
 import argparse
 import itertools
-from typing import Dict, List
+import os
+from typing import Dict
 
-import numpy as np
 import torch
 
 from src.agent import ModelAgent

@@ -1,7 +1,7 @@
 import numpy as np
+
 from src.constants import MAX_HAND_SIZE, NUM_VALUES, Color
 from src.hand import Hand
-
 
 # Constraint matrix cell values
 _SLOT_EMPTY    = -1  # slot does not exist (opponent has no card here)

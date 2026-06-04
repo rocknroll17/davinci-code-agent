@@ -11,17 +11,17 @@ Training:              PPOTrainer, PPOConfig, RewardConfig, RolloutBuffer, Trans
 Play / evaluate:       run_episode, EpisodeResult, EvalSuite, EvalReport
 """
 
-from src.env import DaVinciCodeEnv
-from src.constants import Phase, Color, CardValue
-from src.model import DaVinciCodePolicy, obs_to_tensor, action_mask_to_tensor
 from src.agent import ModelAgent
-from src.interfaces import Agent, BatchAgent, Policy
-from src.reward_config import RewardConfig
-from src.episode import Episode
-from src.runner import run_episode, EpisodeResult
-from src.trainer import PPOTrainer, PPOConfig
 from src.buffer import RolloutBuffer, Transition
-from src.eval_suite import EvalSuite, EvalReport
+from src.constants import CardValue, Color, Phase
+from src.env import DaVinciCodeEnv
+from src.episode import Episode
+from src.eval_suite import EvalReport, EvalSuite
+from src.interfaces import Agent, BatchAgent, Policy
+from src.model import DaVinciCodePolicy, action_mask_to_tensor, obs_to_tensor
+from src.reward_config import RewardConfig
+from src.runner import EpisodeResult, run_episode
+from src.trainer import PPOConfig, PPOTrainer
 
 __all__ = [
     # game engine

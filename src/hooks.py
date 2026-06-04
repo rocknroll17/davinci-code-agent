@@ -39,7 +39,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from collections import deque
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 

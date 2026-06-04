@@ -1,9 +1,9 @@
 """Card class for Da Vinci Code Game."""
 
+from abc import ABC
 from dataclasses import dataclass, field
-from abc import ABC, abstractmethod
 
-from src.constants import Color, CardValue
+from src.constants import CardValue, Color
 
 
 @dataclass

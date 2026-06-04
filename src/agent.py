@@ -23,12 +23,13 @@ logits = agent.logits(obs, action_mask)
 from __future__ import annotations
 
 import os
-import torch
-import numpy as np
 from typing import Dict, Optional, Tuple
 
-from src.model import DaVinciCodePolicy, obs_to_tensor, action_mask_to_tensor
+import numpy as np
+import torch
+
 from src.constants import ACTION_KEYS, CHECKPOINT_BEST
+from src.model import DaVinciCodePolicy, action_mask_to_tensor, obs_to_tensor
 
 
 class ModelAgent:

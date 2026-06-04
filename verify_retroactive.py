@@ -13,12 +13,15 @@ retroactive reward → directly checkable.
 import numpy as np
 import torch
 
-from src.trainer import PPOTrainer, PPOConfig
 from src.constants import (
+    REWARD_CONTINUE_FAIL,
+    REWARD_CONTINUE_SUCCESS,
+    REWARD_DRAW_LOSE,
+    REWARD_DRAW_WIN,
+    REWARD_LOSE,
     Phase,
-    REWARD_DRAW_WIN, REWARD_DRAW_LOSE,
-    REWARD_CONTINUE_SUCCESS, REWARD_CONTINUE_FAIL, REWARD_LOSE,
 )
+from src.trainer import PPOConfig, PPOTrainer
 
 EPS = 1e-4
 

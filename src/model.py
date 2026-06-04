@@ -14,14 +14,15 @@ Key improvements:
 - Layer normalization for training stability
 """
 
+from typing import Dict, Optional, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
-import numpy as np
-from typing import Optional, Tuple, Dict
 
-from src.constants import Phase, MAX_HAND_SIZE, NUM_VALUES, MASK_VALUE
+from src.constants import MASK_VALUE, MAX_HAND_SIZE, NUM_VALUES
 
 
 class ObservationEncoder(nn.Module):

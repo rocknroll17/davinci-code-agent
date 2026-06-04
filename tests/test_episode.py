@@ -1,13 +1,11 @@
 """Unit tests for Episode.finalize — retroactive reward attribution."""
 from dataclasses import dataclass
 
-import numpy as np
-
-from src.episode import Episode
-from src.reward_config import RewardConfig
 from src.constants import Phase
+from src.episode import Episode
 from src.result.guess_result import GuessResult
 from src.result.streak_result import StreakResult
+from src.reward_config import RewardConfig
 
 
 @dataclass

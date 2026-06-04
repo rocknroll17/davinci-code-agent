@@ -11,7 +11,6 @@ import numpy as np
 import pytest
 
 from src.env import DaVinciCodeEnv
-from src.constants import Phase
 
 
 class RandomAgent:

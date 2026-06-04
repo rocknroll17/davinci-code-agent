@@ -1,6 +1,5 @@
 import logging
 from logging.handlers import RotatingFileHandler
-import os
 
 LOG_FILE = "Game_log.log"
 LOG_LEVEL = logging.INFO

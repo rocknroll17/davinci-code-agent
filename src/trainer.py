@@ -5,27 +5,27 @@ Implements Proximal Policy Optimization algorithm for training
 the policy network through adversarial self-play.
 """
 
+import json
+import logging
 import os
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-from typing import Any, Dict, Optional, Tuple, List, Callable
-from dataclasses import dataclass, field
-import json
-from datetime import datetime
 
-from src.model import DaVinciCodePolicy, obs_to_tensor, action_mask_to_tensor
 from src.buffer import RolloutBuffer, Transition
-from src.episode import Episode
-from src.reward_config import RewardConfig
-from src.env import DaVinciCodeEnv
-from src.vec_env import VectorDaVinciEnv, SubprocVecEnv
 from src.constants import Phase
+from src.episode import Episode
+from src.model import DaVinciCodePolicy
 from src.result.result import Result
+from src.reward_config import RewardConfig
+from src.vec_env import SubprocVecEnv, VectorDaVinciEnv
 from src.visualizer import DaVinciVisualizer, get_visualizer
 
-import logging
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -226,7 +226,7 @@ class PPOTrainer:
             Dictionary of rollout statistics
         """
         self.buffer.clear()
-        obs, infos = self.vec_env.reset()
+        obs, _ = self.vec_env.reset()
         backend = "multiprocess" if self._use_subproc else "threaded"
         logger.info(f"Starting rollout collection with {self.n_envs} parallel envs ({backend})")
 
@@ -285,7 +285,6 @@ class PPOTrainer:
                     self._update_viz_from_vec(viz, rewards[0], episode_rewards[0], actions[0], results[0])
 
             obs = next_obs
-            infos = next_infos
 
         return self._finalize_rollouts(obs, completed_rewards, completed_lengths, steps_collected)
 
@@ -539,9 +538,8 @@ class PPOTrainer:
                     value_loss = 0.5 * ((values - batch["returns"]) ** 2).mean()
                 
                 # Total loss: policy_loss - entropy_bonus + value_loss + belief_loss
-                # We want to MAXIMIZE entropy, so we SUBTRACT it from loss
-                entropy_loss = -entropy_mean  # For logging (negative = good)
-                
+                # We want to MAXIMIZE entropy, so we SUBTRACT it from loss (below).
+
                 # Auxiliary belief loss: predict opponent's hidden card values
                 # Impossible-value masking: values that are structurally impossible for a given
                 # opponent slot (same-color cards already in my hand, or already revealed by opp)

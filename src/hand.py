@@ -2,8 +2,10 @@ import random
 from typing import List, Optional, Tuple
 
 import numpy as np
+
 from src.cards.card import Card, OpponentCard
 from src.constants import MAX_HAND_SIZE, CardValue, Color
+
 
 class Hand(list[Card]):
     """

@@ -3,10 +3,10 @@
 import random
 from typing import List, Optional
 
-from src.cards.card import Card
 from src.cards.black_card import BlackCard
+from src.cards.card import Card
 from src.cards.white_card import WhiteCard
-from src.constants import Color, CardValue
+from src.constants import CardValue, Color
 
 
 class Deck:

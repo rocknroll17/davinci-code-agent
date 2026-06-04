@@ -1,7 +1,6 @@
 """run_episode contract: single-agent and head-to-head."""
-import numpy as np
 
-from src.runner import run_episode, EpisodeResult
+from src.runner import EpisodeResult, run_episode
 
 
 def test_single_agent_episode(env, agent):

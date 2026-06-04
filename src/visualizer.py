@@ -3,18 +3,18 @@ Da Vinci Code Game Visualizer using Rich Live.
 학습 중 게임 상태를 실시간으로 시각화합니다.
 """
 
-from rich.console import Console, Group
+import time
+from typing import List, Optional
+
+import numpy as np
+from rich.console import Console
+from rich.layout import Layout
 from rich.live import Live
-from rich.text import Text
 from rich.panel import Panel
 from rich.table import Table
-from rich.layout import Layout
-from rich.style import Style
-from typing import Optional, List, Dict
-import numpy as np
-import time
+from rich.text import Text
 
-from src.constants import Phase, Color, CardValue, MAX_HAND_SIZE
+from src.constants import MAX_HAND_SIZE, CardValue, Color
 from src.result.result import Result
 
 

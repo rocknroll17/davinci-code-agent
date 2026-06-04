@@ -1,11 +1,10 @@
 """Every env step's reward must match the rule re-derivation (RewardConfig)."""
 import numpy as np
-import pytest
 
+from src.constants import CardValue, Phase
 from src.env import DaVinciCodeEnv
 from src.reward_config import RewardConfig
-from src.constants import Phase, CardValue
-from src.utils.game_logic import find_determined_cards, count_candidate_cards
+from src.utils.game_logic import count_candidate_cards, find_determined_cards
 
 EPS = 1e-6
 

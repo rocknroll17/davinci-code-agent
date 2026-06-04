@@ -5,8 +5,8 @@ import numpy as np
 import pytest
 import torch
 
-from src.trainer import PPOTrainer, PPOConfig
 from src.constants import Phase
+from src.trainer import PPOConfig, PPOTrainer
 
 EPS = 1e-4
 

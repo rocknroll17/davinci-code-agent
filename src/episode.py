@@ -33,9 +33,9 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from src.constants import Phase
-from src.reward_config import RewardConfig
 from src.result.guess_result import GuessResult
 from src.result.streak_result import StreakResult
+from src.reward_config import RewardConfig
 
 
 @dataclass
@@ -60,13 +60,13 @@ class Episode:
 
     def record(self, transition: Any, phase: int, result: Any) -> None:
         """Record one executed move (called every step for this env)."""
-        is_continue = (
+        is_continue = bool(
             isinstance(result, StreakResult)
             and not result.is_invalid
             and result.is_continue
         )
-        is_guess = isinstance(result, GuessResult) and not result.is_invalid
-        guess_correct = result.is_correct if is_guess else None
+        is_guess = bool(isinstance(result, GuessResult) and not result.is_invalid)
+        guess_correct = bool(result.is_correct) if is_guess else None
         self.moves.append(GameMove(
             transition=transition,
             phase=int(phase),

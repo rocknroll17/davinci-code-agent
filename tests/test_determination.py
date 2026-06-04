@@ -1,9 +1,9 @@
 """Direct unit tests for the determined/candidate logic (breaks the circularity
 where test_rewards re-derives STOP penalty from the same functions it tests)."""
-from src.hand import Hand
 from src.cards.black_card import BlackCard
 from src.cards.white_card import WhiteCard
-from src.utils.game_logic import find_determined_cards, count_candidate_cards
+from src.hand import Hand
+from src.utils.game_logic import count_candidate_cards, find_determined_cards
 
 
 def _hand(cards):

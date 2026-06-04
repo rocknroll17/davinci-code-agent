@@ -1,8 +1,6 @@
 """Monotone reward mode: the terminal win bonus must be dropped at env level."""
-import numpy as np
 
 from src.env import DaVinciCodeEnv
-from src.runner import run_episode
 
 
 def _max_step_reward(env, agent, n_games=15):

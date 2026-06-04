@@ -1,25 +1,28 @@
 """Da Vinci Code Gymnasium Environment."""
 
-import os
 import logging
-from typing import Any, Optional, SupportsFloat
-import numpy as np
+import os
+from typing import Any, Optional
+
 import gymnasium as gym
+import numpy as np
 from gymnasium import spaces
 
-from src.constants import (
-    Phase, Color, MAX_HAND_SIZE, NUM_VALUES, INITIAL_HAND_SIZE_2P,
-)
-from src.reward_config import RewardConfig
-from src.deck import Deck
-from src.hand import Hand
 from src.cards.card import Card
-from src.player import Player
-from src.result.guess_result import GuessResult
-from src.result.draw_result import DrawResult
-from src.result.result import Result
-from src.result.streak_result import StreakResult
+from src.constants import (
+    INITIAL_HAND_SIZE_2P,
+    MAX_HAND_SIZE,
+    NUM_VALUES,
+    Color,
+    Phase,
+)
+from src.deck import Deck
 from src.phase import PhaseCycle
+from src.player import Player
+from src.result.draw_result import DrawResult
+from src.result.guess_result import GuessResult
+from src.result.streak_result import StreakResult
+from src.reward_config import RewardConfig
 
 logger = logging.getLogger(__name__)
 
@@ -476,7 +479,7 @@ class DaVinciCodeEnv(gym.Env):
 
         if decision == 0:  # STOP
             # 확정된 미공개 카드가 있는데 맞추지 않고 stop하면 페널티
-            from src.utils.game_logic import find_determined_cards, count_candidate_cards
+            from src.utils.game_logic import count_candidate_cards, find_determined_cards
             determined = find_determined_cards(
                 self.players[self._current_player]._hand,
                 self.players[1 - self._current_player]._hand

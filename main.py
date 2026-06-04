@@ -10,11 +10,12 @@ python main.py --dashboard-port 8080 로 포트 변경
 
 import os
 import sys
+
 import torch
 
-import src.utils.logger  # configure root logger early
-from src.trainer import PPOTrainer, PPOConfig
-from src.visualizer import create_visualizer, get_visualizer
+import src.utils.logger  # noqa: F401  (configures root logger on import)
+from src.trainer import PPOConfig, PPOTrainer
+from src.visualizer import create_visualizer
 
 # ============== 설정 ==============
 CHECKPOINT_DIR = "checkpoints"

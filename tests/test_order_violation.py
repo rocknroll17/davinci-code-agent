@@ -1,9 +1,9 @@
 """The ordering-violation penalty must actually FIRE for an out-of-range guess
 (test_rewards only checks it's 0 OR the penalty; this proves it triggers)."""
-from src.env import DaVinciCodeEnv
-from src.hand import Hand
 from src.cards.black_card import BlackCard
 from src.constants import Color
+from src.env import DaVinciCodeEnv
+from src.hand import Hand
 
 
 def _opp_hand_with_revealed_neighbors():

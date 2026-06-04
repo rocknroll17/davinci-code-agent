@@ -9,19 +9,28 @@ The trainer also adds *retroactive* rewards in the rollout buffer
 and are listed separately at the end.
 """
 import argparse
+
 import numpy as np
 import torch
 
-from src.env import DaVinciCodeEnv
 from src.agent import ModelAgent
 from src.constants import (
-    Phase, CardValue,
-    REWARD_WIN, REWARD_GUESS_SUCCESS, REWARD_JOKER_SUCCESS, REWARD_GUESS_FAIL,
-    REWARD_GUESS_ORDER_VIOLATION, REWARD_STREAK_BONUS_MULTIPLIER, REWARD_STREAK_BREAK,
-    REWARD_INVALID_ACTION, REWARD_STOP_DECISION,
-    REWARD_STOP_WITH_DETERMINED, REWARD_STOP_WITH_NEAR_DETERMINED,
+    REWARD_GUESS_FAIL,
+    REWARD_GUESS_ORDER_VIOLATION,
+    REWARD_GUESS_SUCCESS,
+    REWARD_INVALID_ACTION,
+    REWARD_JOKER_SUCCESS,
+    REWARD_STOP_DECISION,
+    REWARD_STOP_WITH_DETERMINED,
+    REWARD_STOP_WITH_NEAR_DETERMINED,
+    REWARD_STREAK_BONUS_MULTIPLIER,
+    REWARD_STREAK_BREAK,
+    REWARD_WIN,
+    CardValue,
+    Phase,
 )
-from src.utils.game_logic import find_determined_cards, count_candidate_cards
+from src.env import DaVinciCodeEnv
+from src.utils.game_logic import count_candidate_cards, find_determined_cards
 
 EPS = 1e-5
 

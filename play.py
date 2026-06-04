@@ -12,25 +12,23 @@ Usage:
     python play.py --delay 1.0        # 자동 진행 시 딜레이 (초)
 """
 
-import os
-import sys
-import time
 import argparse
-import torch
-import numpy as np
+import os
+import time
 
+import numpy as np
+import torch
+from rich import box
 from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from rich.layout import Layout
-from rich.live import Live
-from rich import box
 
+from src.constants import MAX_HAND_SIZE, CardValue, Color, Phase
 from src.env import DaVinciCodeEnv
-from src.model import DaVinciCodePolicy, obs_to_tensor, action_mask_to_tensor
-from src.constants import Phase, Color, CardValue, MAX_HAND_SIZE
-
+from src.model import DaVinciCodePolicy, action_mask_to_tensor, obs_to_tensor
 
 console = Console()
 

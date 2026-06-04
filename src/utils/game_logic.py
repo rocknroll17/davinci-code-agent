@@ -2,8 +2,8 @@
 
 from typing import List, Tuple
 
+from src.constants import NUM_VALUES, CardValue
 from src.hand import Hand
-from src.constants import Color, CardValue, NUM_VALUES
 
 
 def _build_available_values(

@@ -1,5 +1,6 @@
 from .result import Result
 
+
 class StreakResult(Result):
     """Class representing a streak result in a game."""
     def __init__(self, player_id: int, reward: float, is_continue: bool, is_invalid: bool = False) -> None:

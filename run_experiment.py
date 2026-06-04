@@ -20,9 +20,8 @@ Example
   python run_experiment.py --exp layers --n-layers 5 --device-id 3
 """
 
-import os
-import sys
 import argparse
+import os
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,9 +58,10 @@ def main() -> None:
     os.environ.setdefault("MKL_NUM_THREADS", str(args.torch_threads))
 
     import torch
-    import src.utils.logger  # configure root logger
-    from src.trainer import PPOTrainer, PPOConfig
+
+    import src.utils.logger  # noqa: F401  (configures root logger)
     from src.hooks import NaNDetector
+    from src.trainer import PPOConfig, PPOTrainer
 
     torch.set_num_threads(args.torch_threads)
 

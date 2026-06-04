@@ -26,13 +26,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
 import numpy as np
 import torch
 
+from src.constants import MAX_HAND_SIZE, CardValue, Phase
 from src.env import DaVinciCodeEnv
-from src.model import DaVinciCodePolicy, obs_to_tensor, action_mask_to_tensor
-from src.constants import CardValue, Phase, MAX_HAND_SIZE
-
+from src.model import DaVinciCodePolicy, obs_to_tensor
 
 # ---------------------------------------------------------------------------
 # EvalReport
