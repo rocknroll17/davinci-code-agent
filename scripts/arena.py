@@ -32,7 +32,6 @@ from src.trainer import PPOTrainer, PPOConfig
 from src.model import DaVinciCodePolicy, obs_to_tensor, action_mask_to_tensor
 from src.env import DaVinciCodeEnv
 from src.constants import MAX_HAND_SIZE, NUM_VALUES, MASK_VALUE
-from src.vec_env import VectorDaVinciEnv
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DEFINE YOUR VARIANTS HERE.  variant 0 is the data generator (trained on-policy).
@@ -166,32 +165,56 @@ def variant_update(model, optimizer, cfg, shared, returns_np, adv_np, device):
 # ─────────────────────────────────────────────────────────────────────────────
 # Round-robin head-to-head (GPU-batched, randomized starting side).
 # ─────────────────────────────────────────────────────────────────────────────
-def h2h(model_a, model_b, device, episodes=1000, n_envs=400):
+def _cur_players(infos, n):
+    return np.fromiter((infos[i]["current_player"] for i in range(n)), dtype=np.int64, count=n)
+
+
+def _act_split(model_a, model_b, ot, mt, useA, n, device):
+    """Run A only on the envs where A is to move and B only on B's — halves forward work."""
+    actions = np.zeros((n, 4), dtype=np.int64)
+    useA_t = torch.from_numpy(useA).to(device)
+    for model, sel in ((model_a, useA_t), (model_b, ~useA_t)):
+        if not bool(sel.any()):
+            continue
+        idx = sel.nonzero(as_tuple=True)[0]
+        sub_o = {k: v[idx] for k, v in ot.items()}
+        sub_m = {k: v[idx] for k, v in mt.items()}
+        with torch.no_grad():
+            a, _, _ = model.get_action(sub_o, sub_m, deterministic=True)
+        actions[idx.cpu().numpy()] = a
+    return actions
+
+
+def h2h(model_a, model_b, device, episodes=1000, n_envs=400, n_workers=None):
+    """GPU-batched head-to-head on a MULTIPROCESS vec-env (true parallel CPU stepping — env
+    step/mask was ~70% of the old VectorDaVinciEnv version's time). Forward is split so each
+    model only runs on the envs where it is to move."""
+    from src.vec_env import SubprocVecEnv
+    env = SubprocVecEnv(n_envs=n_envs, n_workers=n_workers or os.cpu_count())
+    n = env.n_envs
     rng = np.random.default_rng(0)
-    env = VectorDaVinciEnv(n_envs=n_envs)
-    obs, _ = env.reset()
-    a_seat0 = rng.random(n_envs) < 0.5
+    obs, infos = env.reset()
+    cur = _cur_players(infos, n)
+    a_seat0 = rng.random(n) < 0.5
     a_wins = b = done = 0
     bt = lambda o: {k: torch.from_numpy(v).to(device) for k, v in o.items()}
     bm = lambda m: {k: torch.from_numpy(v).bool().to(device) for k, v in m.items()}
     while done < episodes:
         masks = env.get_action_masks()
         ot, mt = bt(obs), bm(masks)
-        with torch.no_grad():
-            aA, _, _ = model_a.get_action(ot, mt, deterministic=True)
-            aB, _, _ = model_b.get_action(ot, mt, deterministic=True)
-        cur = np.array([env.envs[i]._current_player for i in range(n_envs)])
         useA = (a_seat0 & (cur == 0)) | (~a_seat0 & (cur == 1))
-        acts = np.where(useA[:, None], aA, aB)
-        next_obs, _, term, trunc, infos, _ = env.step(acts)
+        acts = _act_split(model_a, model_b, ot, mt, useA, n, device)
+        next_obs, _, term, trunc, infos, _ = env.step(acts)   # auto-reset inside workers
+        cur = _cur_players(infos, n)
         for i in np.nonzero(term | trunc)[0]:
-            w = env.envs[i]._winner
+            w = infos[i].get("_winner")
             if w is not None:
                 a_won = (w == 0) if a_seat0[i] else (w == 1)
                 a_wins += int(a_won); b += int(not a_won); done += 1
-            no, infos[i] = env.reset_single(i)
+            ro = infos[i]["_reset_obs"]
             for k in next_obs:
-                next_obs[k][i] = no[k]
+                next_obs[k][i] = ro[k]
+            cur[i] = infos[i]["_reset_info"]["current_player"]
             a_seat0[i] = rng.random() < 0.5
         obs = next_obs
     return a_wins, b, done
@@ -268,7 +291,8 @@ def main():
         for b in names:
             if a == b:
                 row += f"{'—':>10}"; continue
-            aw, bw, tot = h2h(models[a], models[b], hd, episodes=args.h2h_episodes)
+            aw, bw, tot = h2h(models[a], models[b], hd, episodes=args.h2h_episodes,
+                              n_envs=500, n_workers=args.workers)
             row += f"{aw/tot:>9.1%} "
             wins[a] += aw; games[a] += tot
         print(row)
