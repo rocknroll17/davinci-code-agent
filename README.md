@@ -69,8 +69,9 @@ opponent's hidden values; its gradient shapes the encoder toward representations
 good for *deduction*, and its (detached) prediction enriches the per-slot features the
 GUESS head attends to.
 
-> **Full I/O spec, tokenization, and the belief→action pipeline:** see
-> [`src/docs/model.md`](src/docs/model.md).
+> **Full I/O spec (observation/action/reward):** see [`src/docs/model.md`](src/docs/model.md).
+> **Architecture deep-dive (tokenization, Transformer, belief→action pipeline):** see
+> [`MODEL_EXPLAINED.md`](MODEL_EXPLAINED.md).
 
 ## Features
 
@@ -135,7 +136,7 @@ Outcome-dominated, with small shaping terms (exact values in [`src/constants.py`
 | `my_hand` | (13, 2) | my tiles `[color, value]` |
 | `opponent_hand` | (13, 2) | opponent tiles (hidden value = −1) |
 | `remaining_deck` | (2,) | remaining [black, white] |
-| `constraint_matrix` | (13, 13) | per-slot ruled-out values (rule-derived) |
+| `constraint_matrix` | (13, 13) | per-slot ruled-out values from play (failed guesses + revealed cards); cells `{-1, 0, 1}` |
 
 **Actions** (phase-gated heads):
 
