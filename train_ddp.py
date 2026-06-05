@@ -40,6 +40,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--torch-threads", type=int, default=4)
     p.add_argument("--fp16", action="store_true")
     p.add_argument("--compile", action="store_true")
+    p.add_argument("--learning-rate", type=float, default=None,
+                   help="override start LR (e.g. 3e-5 when continuing a mature model)")
+    p.add_argument("--lr-end", type=float, default=None, help="override final LR")
     p.add_argument("--dashboard-port", type=int, default=0)
     return p.parse_args()
 
@@ -72,6 +75,11 @@ def main() -> None:
         )
 
     exp_dir = os.path.join("experiments", args.exp)
+    lr_overrides = {}
+    if args.learning_rate is not None:
+        lr_overrides["learning_rate"] = args.learning_rate
+    if args.lr_end is not None:
+        lr_overrides["lr_end"] = args.lr_end
     config = PPOConfig(
         total_timesteps=args.total_timesteps,
         n_envs=args.n_envs,
@@ -86,6 +94,7 @@ def main() -> None:
         monotone_reward=(args.reward_mode == "monotone"),
         save_dir=os.path.join(exp_dir, "checkpoints"),
         log_dir=os.path.join(exp_dir, "logs"),
+        **lr_overrides,
     )
 
     if rank == 0:
