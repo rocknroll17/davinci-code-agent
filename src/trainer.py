@@ -197,6 +197,9 @@ class PPOTrainer:
         # when per-rank timestep counts diverge (variable episode lengths).
         self._last_global_timesteps = 0
         self.best_win_rate = 0.0
+        # best_model is saved on highest rollout mean_reward; -inf so the first
+        # update always sets a baseline. Persisted in the checkpoint (see save/load).
+        self.best_mean_reward = float("-inf")
         
         # Logging
         self.episode_rewards: List[float] = []
@@ -789,6 +792,7 @@ class PPOTrainer:
             "timesteps": global_timesteps,
             "episodes": self.world_size * self.episodes,
             "updates": self.updates,
+            "best_mean_reward": self.best_mean_reward,
             "config": self.config.to_dict()
         }, path)
         
@@ -801,7 +805,10 @@ class PPOTrainer:
         Args:
             path: Path to checkpoint
         """
-        checkpoint = torch.load(path, map_location=self.device)
+        # weights_only=False: our own checkpoints are trusted and some (e.g. the
+        # deployed model) store numpy scalars that torch 2.x's default weights_only
+        # loader rejects. Matches ModelAgent.from_checkpoint.
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
         # Normalize torch.compile's "_orig_mod." wrapper on BOTH sides so a
         # checkpoint loads regardless of whether either it or the current model
@@ -854,6 +861,7 @@ class PPOTrainer:
         self._last_global_timesteps = g_ts
         self.episodes = int(checkpoint["episodes"]) // self.world_size
         self.updates = checkpoint["updates"]
+        self.best_mean_reward = checkpoint.get("best_mean_reward", float("-inf"))
         
         # Always apply config LR (checkpoint may have old LR)
         for pg in self.optimizer.param_groups:
@@ -947,14 +955,18 @@ class PPOTrainer:
                     "learning_rate":       current_lr,
                 })
 
+            # best_model = highest rollout mean_reward, checked every update and
+            # persisted across restarts (best_mean_reward is saved in the checkpoint).
+            if self.is_main and rollout_stats["mean_reward"] > self.best_mean_reward:
+                self.best_mean_reward = rollout_stats["mean_reward"]
+                self.save(os.path.join(self.config.save_dir, "best_model.pt"))
+
+            # eval here is only for logging the (deterministic self-play) win-rate metric.
             if self.is_main and update_count % self.config.eval_interval == 0:
                 eval_stats = self.evaluate(self.config.n_eval_episodes)
                 print(f"\n[Eval] P0 Win Rate: {eval_stats['player0_win_rate']:.2%} | "
                       f"P1 Win Rate: {eval_stats['player1_win_rate']:.2%} | "
                       f"Mean Length: {eval_stats['mean_episode_length']:.1f}\n")
-                if eval_stats['player0_win_rate'] > self.best_win_rate:
-                    self.best_win_rate = eval_stats['player0_win_rate']
-                    self.save(os.path.join(self.config.save_dir, "best_model.pt"))
                 self._call_hooks_eval(eval_stats)
 
             if self.is_main and update_count % self.config.save_interval == 0:
