@@ -157,6 +157,7 @@ class DreamerTrainer:
 
         done_episodes = 0
         ep_rewards = []
+        guess_hits = guess_total = 0
         while done_episodes < n_episodes:
             obs_t = {k: torch.as_tensor(v).to(self.device) for k, v in self._obs.items()}
             masks_np = self.vec_env.get_action_masks()
@@ -179,7 +180,14 @@ class DreamerTrainer:
             dones = terminated | truncated
             self.total_env_steps += self.cfg.n_envs
 
+            phase_np = self._obs["phase"].argmax(-1)
             for i in range(self.cfg.n_envs):
+                # actor skill proxy: accuracy of GUESS-phase actions (visible
+                # long before the win rate moves off 0%)
+                if phase_np[i] == 1:
+                    guess_total += 1
+                    if rewards[i] > 0:
+                        guess_hits += 1
                 # perspective flip = the acting player changed vs the previous step
                 pid = int(results[i].player_id) if (
                     results[i] is not None and hasattr(results[i], "player_id")) else 0
@@ -218,6 +226,7 @@ class DreamerTrainer:
             self._obs = next_obs
 
         return {"collect/mean_ep_reward": float(np.mean(ep_rewards)) if ep_rewards else 0.0,
+                "collect/guess_acc": guess_hits / max(1, guess_total),
                 "collect/episodes": done_episodes}
 
     def _random_masked_action(self, masks_np) -> torch.Tensor:
@@ -409,13 +418,16 @@ class DreamerTrainer:
                 print(f"[dreamer] round {r} | steps {ws * self.total_env_steps:,} "
                       f"| eps {ws * self.total_episodes} "
                       f"| R {cstats['collect/mean_ep_reward']:.2f} "
+                      f"| acc {cstats.get('collect/guess_acc', 0):.1%} "
                       f"| wm {wm_m.get('wm/loss', 0):.2f} "
                       f"(obs {wm_m.get('wm/obs', 0):.2f}, "
                       f"rew {wm_m.get('wm/reward', 0):.2f}, "
+                      f"flip {wm_m.get('wm/flip', 0):.3f}, "
                       f"kl {wm_m.get('wm/kl_dyn', 0):.2f}) "
                       f"| actor {ac_m.get('ac/actor_loss', 0):.4f} "
                       f"| critic {ac_m.get('ac/critic_loss', 0):.2f} "
-                      f"| ret {ac_m.get('ac/return_mean', 0):.2f}/S={ac_m.get('ac/return_scale', 0):.1f} "
+                      f"| ret {ac_m.get('ac/return_mean', 0):.2f}"
+                      f"/adv {ac_m.get('ac/adv_std', 0):.3f} "
                       f"| ent {ac_m.get('ac/entropy', 0):.2f}")
             if self.is_main:
                 self.save(os.path.join(self.cfg.save_dir, "dreamer_latest.pt"))

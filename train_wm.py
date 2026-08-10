@@ -48,6 +48,8 @@ def main() -> None:
                     help="parallel environment worker processes per rank")
     ap.add_argument("--entropy-scale", type=float, default=None,
                     help="actor entropy bonus (default 3e-4; raise to fight collapse)")
+    ap.add_argument("--ac-lr", type=float, default=None,
+                    help="actor-critic learning rate (default 3e-5)")
     ap.add_argument("--prefill", type=int, default=None,
                     help="random prefill episodes per rank")
     ap.add_argument("--eval-every", type=int, default=None,
@@ -109,6 +111,8 @@ def main() -> None:
         cfg.n_workers = args.n_workers
     if args.entropy_scale is not None:
         cfg.entropy_scale = args.entropy_scale
+    if args.ac_lr is not None:
+        cfg.ac_lr = args.ac_lr
     if args.prefill is not None:
         cfg.prefill_episodes = args.prefill
     if args.eval_every is not None:
