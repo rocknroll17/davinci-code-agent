@@ -59,6 +59,12 @@ class PPOConfig:
     n_layers: int = 4  # encoder transformer layer count
     zero_init: bool = False  # if True, init all default weights/biases to 0 (designated inits kept)
 
+    # Game variant: agent chooses joker insert positions (JOKER phase + 5th
+    # action head) instead of random placement. Changes the observation space
+    # (4-dim phase one-hot) — checkpoints trained without it get phase_proj
+    # re-initialized on load.
+    joker_control: bool = True
+
     # Performance
     fp16: bool = False    # mixed-precision (autocast fp16 + GradScaler). Turing→fp16, not bf16.
     compile: bool = False  # torch.compile the encoder (skips .any()-branchy get_action)
@@ -134,6 +140,7 @@ class PPOTrainer:
             n_heads=config.n_heads,
             n_layers=config.n_layers,
             zero_init=config.zero_init,
+            joker_control=config.joker_control,
         ).to(self.device)
 
         # Mixed precision (fp16 + GradScaler). fp16 is CUDA-only (Turing → fp16),
@@ -175,10 +182,12 @@ class PPOTrainer:
         env_seed = (1 + rank) * 100000 if world_size > 1 else None
         if self._use_subproc:
             self.vec_env = SubprocVecEnv(n_envs=config.n_envs, n_workers=config.n_workers,
-                                         seed=env_seed, reward_config=config.reward_config)
+                                         seed=env_seed, reward_config=config.reward_config,
+                                         joker_control=config.joker_control)
         else:
             self.vec_env = VectorDaVinciEnv(n_envs=config.n_envs, seed=env_seed,
-                                            reward_config=config.reward_config)
+                                            reward_config=config.reward_config,
+                                            joker_control=config.joker_control)
         self.env = self.vec_env.get_viz_env()  # For visualization compatibility
         
         # Rollout buffer (에피소드 기반 수집이라 size 제한 없음)
@@ -534,13 +543,19 @@ class PPOTrainer:
                 num_active_heads = 0
                 
                 phase = batch["obs"]["phase"]
-                
-                for key in ["color", "position", "value", "decision"]:
+
+                head_keys = ["color", "position", "value", "decision"]
+                if self.config.joker_control:
+                    head_keys.append("joker")
+
+                for key in head_keys:
                     # Get phase mask for this head
                     if key == "color":
                         head_mask = phase[:, 0].bool()
                     elif key in ["position", "value"]:
                         head_mask = phase[:, 1].bool()
+                    elif key == "joker":
+                        head_mask = phase[:, 3].bool()
                     else:
                         head_mask = phase[:, 2].bool()
                     

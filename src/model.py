@@ -60,21 +60,27 @@ class ObservationEncoder(nn.Module):
         hidden_dim: int = 512,
         token_dim: int = 128,
         n_heads: int = 4,
-        n_layers: int = 4
+        n_layers: int = 4,
+        joker_control: bool = False
     ) -> None:
         """
         Initialize the Unified Transformer encoder.
-        
+
         Args:
             hidden_dim: Output feature dimension (must match action heads)
             token_dim: Per-token embedding dimension
             n_heads: Number of attention heads (head_dim = token_dim / n_heads)
             n_layers: Number of full self-attention layers
+            joker_control: If True, the phase one-hot is 4-dim (JOKER phase) and
+                forward() additionally returns per-position MY-hand features for
+                the joker placement head (4-tuple instead of 3-tuple).
         """
         super().__init__()
-        
+
         self.hidden_dim = hidden_dim
         self.token_dim = token_dim
+        self.joker_control = joker_control
+        self.n_phases = 4 if joker_control else 3
         
         # === Card Tokenizer ===
         # Color: BLACK=0, WHITE=1, NONE(-1)→2
@@ -113,7 +119,7 @@ class ObservationEncoder(nn.Module):
         
         # Special token projections
         self.phase_proj = nn.Sequential(
-            nn.Linear(3, token_dim),
+            nn.Linear(self.n_phases, token_dim),
             nn.LayerNorm(token_dim)
         )
         self.deck_proj = nn.Sequential(
@@ -144,6 +150,11 @@ class ObservationEncoder(nn.Module):
         # === Output projections ===
         # Opponent per-position: token_dim → 64 (position head 호환)
         self.opp_per_pos_proj = nn.Linear(token_dim, 64)
+
+        # My-hand per-position: token_dim → 64, joker placement head 입력.
+        # joker_control일 때만 존재 → legacy 체크포인트와 파라미터 집합 동일 유지.
+        if joker_control:
+            self.my_per_pos_proj = nn.Linear(token_dim, 64)
         
         # Global fusion: mean pool 28 tokens → hidden_dim
         self.fusion = nn.Sequential(
@@ -294,7 +305,13 @@ class ObservationEncoder(nn.Module):
         # Opponent per-position: tokens[14:27] (shifted by 1 for CLS) → (batch, 13, 64)
         opp_out = all_tokens[:, MAX_HAND_SIZE + 1:2 * MAX_HAND_SIZE + 1, :]
         opponent_per_pos = self.opp_per_pos_proj(opp_out)
-        
+
+        if self.joker_control:
+            # My-hand per-position: tokens[1:14] → (batch, 13, 64) for joker head
+            my_out = all_tokens[:, 1:MAX_HAND_SIZE + 1, :]
+            my_per_pos = self.my_per_pos_proj(my_out)
+            return features, constraint_per_pos, opponent_per_pos, my_per_pos
+
         return features, constraint_per_pos, opponent_per_pos
 
 
@@ -308,16 +325,19 @@ class PhaseGatedActionHead(nn.Module):
     - Numerically stable masking with MASK_VALUE instead of -inf
     """
     
-    def __init__(self, hidden_dim: int = 512) -> None:
+    def __init__(self, hidden_dim: int = 512, joker_control: bool = False) -> None:
         """
         Initialize action heads.
-        
+
         Args:
             hidden_dim: Input feature dimension
+            joker_control: If True, adds a joker placement head (JOKER phase)
+                mirroring the position head but over MY-hand per-slot features.
         """
         super().__init__()
-        
+
         self.hidden_dim = hidden_dim
+        self.joker_control = joker_control
         
         # Color head for DRAW phase (2 outputs: BLACK, WHITE)
         self.color_head = nn.Sequential(
@@ -353,27 +373,54 @@ class PhaseGatedActionHead(nn.Module):
             nn.ReLU(),
             nn.Linear(64, 2)
         )
-    
+
+        # Joker placement head for JOKER phase — per-slot logit over MY hand.
+        # Slot i = "insert before my card i"; slot == hand size (a padded slot)
+        # = append at end. Same shape as position_head but fed my_per_pos.
+        if joker_control:
+            self.joker_head = nn.Sequential(
+                nn.Linear(hidden_dim + 64, 128),
+                nn.ReLU(),
+                nn.Linear(128, 1)
+            )
+
+    def _joker_logits(
+        self,
+        features: torch.Tensor,
+        my_per_pos: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Compute per-slot joker insert logits (batch, 13)."""
+        batch_size = features.size(0)
+        device = features.device
+        features_expanded = features.unsqueeze(1).expand(-1, MAX_HAND_SIZE, -1)
+        if my_per_pos is None:
+            my_per_pos = torch.zeros(batch_size, MAX_HAND_SIZE, 64, device=device)
+        joker_input = torch.cat([features_expanded, my_per_pos], dim=-1)
+        return self.joker_head(joker_input).squeeze(-1)
+
     def forward(
         self,
         features: torch.Tensor,
         phase: torch.Tensor,
         action_mask: Optional[Dict[str, torch.Tensor]] = None,
         selected_position: Optional[torch.Tensor] = None,
-        opponent_per_pos: Optional[torch.Tensor] = None
+        opponent_per_pos: Optional[torch.Tensor] = None,
+        my_per_pos: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Compute action logits for all heads with phase gating.
-        
+
         Args:
             features: Encoded observation features (batch, hidden_dim)
-            phase: One-hot phase vector (batch, 3)
+            phase: One-hot phase vector (batch, 3 or 4 with joker_control)
             action_mask: Optional masks for each action head
             selected_position: Position selected for value conditioning (batch,)
             opponent_per_pos: Per-position opponent features (batch, 13, 64)
                               Encodes constraint info injected before Transformer.
                               Used by both position head and value head.
-            
+            my_per_pos: Per-position MY-hand features (batch, 13, 64) for the
+                        joker head (joker_control only).
+
         Returns:
             Dictionary of action logits for each head
         """
@@ -415,11 +462,18 @@ class PhaseGatedActionHead(nn.Module):
             value_input = torch.cat([features, pos_embed, pos_opp], dim=-1)
             value_logits = self.value_head(value_input)
         
+        joker_logits = None
+        if self.joker_control:
+            joker_logits = self._joker_logits(features, my_per_pos)
+
         # Apply action masks if provided (use MASK_VALUE for numerical stability)
         if action_mask is not None:
             if "color" in action_mask:
                 mask = action_mask["color"].to(device)
                 color_logits = color_logits.masked_fill(~mask, MASK_VALUE)
+            if joker_logits is not None and "joker" in action_mask:
+                mask = action_mask["joker"].to(device)
+                joker_logits = joker_logits.masked_fill(~mask, MASK_VALUE)
             if "position" in action_mask:
                 mask = action_mask["position"].to(device)
                 position_logits = position_logits.masked_fill(~mask, MASK_VALUE)
@@ -460,13 +514,23 @@ class PhaseGatedActionHead(nn.Module):
             decision_logits,
             torch.full_like(decision_logits, MASK_VALUE)
         )
-        
-        return {
+
+        logits = {
             "color": color_logits,
             "position": position_logits,
             "value": value_logits,
             "decision": decision_logits
         }
+
+        if joker_logits is not None:
+            joker_active = phase[:, 3:4].bool()
+            logits["joker"] = torch.where(
+                joker_active.expand_as(joker_logits),
+                joker_logits,
+                torch.full_like(joker_logits, MASK_VALUE)
+            )
+
+        return logits
 
 
 class ValueHead(nn.Module):
@@ -526,7 +590,7 @@ class DaVinciCodePolicy(nn.Module):
     """
     
     def __init__(self, hidden_dim: int = 512, n_heads: int = 4, n_layers: int = 4,
-                 zero_init: bool = False) -> None:
+                 zero_init: bool = False, joker_control: bool = False) -> None:
         """
         Initialize the policy network.
 
@@ -537,14 +601,19 @@ class DaVinciCodePolicy(nn.Module):
             zero_init: If True, every default-initialized weight/bias starts at 0
                        instead of orthogonal/normal. Explicitly designated inits
                        (belief_to_opp_proj zeros, cls_token) are kept as-is.
+            joker_control: If True, the model expects the 4-phase observation
+                       (JOKER phase) and emits a 5th action component "joker"
+                       (insert index for joker placement).
         """
         super().__init__()
 
         self.hidden_dim = hidden_dim
         self._zero_init = zero_init
+        self.joker_control = joker_control
 
-        self.encoder = ObservationEncoder(hidden_dim, n_heads=n_heads, n_layers=n_layers)
-        self.action_heads = PhaseGatedActionHead(hidden_dim)
+        self.encoder = ObservationEncoder(hidden_dim, n_heads=n_heads, n_layers=n_layers,
+                                          joker_control=joker_control)
+        self.action_heads = PhaseGatedActionHead(hidden_dim, joker_control=joker_control)
         self.value_head = ValueHead(hidden_dim)
         
         # Belief head: predict opponent's hidden card values
@@ -589,6 +658,16 @@ class DaVinciCodePolicy(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
+    def _encode(
+        self, obs: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Encoder call that normalizes the legacy 3-tuple / joker 4-tuple return."""
+        out = self.encoder(obs)
+        if self.joker_control:
+            return out  # (features, constraint_per_pos, opponent_per_pos, my_per_pos)
+        features, constraint_per_pos, opponent_per_pos = out
+        return features, constraint_per_pos, opponent_per_pos, None
+
     def _enrich_opp_with_belief(
         self, features: torch.Tensor, opponent_per_pos: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -649,18 +728,19 @@ class DaVinciCodePolicy(nn.Module):
             Tuple of (action_logits_dict, state_value, constraint_per_pos)
         """
         # Encode observation
-        features, constraint_per_pos, opponent_per_pos = self.encoder(obs)
+        features, constraint_per_pos, opponent_per_pos, my_per_pos = self._encode(obs)
 
         # Enrich opponent features with belief predictions
         enriched_opp, _ = self._enrich_opp_with_belief(features, opponent_per_pos)
 
         # Get action logits with phase gating
         action_logits = self.action_heads(
-            features, 
-            obs["phase"].float(), 
+            features,
+            obs["phase"].float(),
             action_mask,
             selected_position,
-            opponent_per_pos=enriched_opp
+            opponent_per_pos=enriched_opp,
+            my_per_pos=my_per_pos
         )
         
         # Get state value
@@ -693,7 +773,7 @@ class DaVinciCodePolicy(nn.Module):
         phase = obs["phase"]
         
         # Encode observation (only once)
-        features, constraint_per_pos, opponent_per_pos = self.encoder(obs)
+        features, constraint_per_pos, opponent_per_pos, my_per_pos = self._encode(obs)
 
         # Enrich opponent features with belief predictions
         enriched_opp, _ = self._enrich_opp_with_belief(features, opponent_per_pos)
@@ -717,7 +797,11 @@ class DaVinciCodePolicy(nn.Module):
         position_logits = self.action_heads.position_head(position_input).squeeze(-1)  # (batch, 13)
         
         decision_logits = self.action_heads.decision_head(features)
-        
+
+        joker_logits = None
+        if self.joker_control:
+            joker_logits = self.action_heads._joker_logits(features, my_per_pos)
+
         # Apply action masks
         if action_mask is not None:
             if "color" in action_mask:
@@ -729,7 +813,10 @@ class DaVinciCodePolicy(nn.Module):
             if "decision" in action_mask:
                 mask = action_mask["decision"].to(device)
                 decision_logits = decision_logits.masked_fill(~mask, MASK_VALUE)
-        
+            if joker_logits is not None and "joker" in action_mask:
+                mask = action_mask["joker"].to(device)
+                joker_logits = joker_logits.masked_fill(~mask, MASK_VALUE)
+
         # Apply phase gating
         draw_active = phase[:, 0:1].bool()
         decision_active = phase[:, 2:3].bool()
@@ -749,7 +836,15 @@ class DaVinciCodePolicy(nn.Module):
             decision_logits,
             torch.full_like(decision_logits, MASK_VALUE)
         )
-        
+
+        if joker_logits is not None:
+            joker_active = phase[:, 3:4].bool()
+            joker_logits = torch.where(
+                joker_active.expand_as(joker_logits),
+                joker_logits,
+                torch.full_like(joker_logits, MASK_VALUE)
+            )
+
         # Sample position first (for value conditioning)
         position_action, position_log_prob = self._sample_from_logits(
             position_logits, deterministic
@@ -794,15 +889,23 @@ class DaVinciCodePolicy(nn.Module):
         log_probs["color"] = color_log_prob
         log_probs["value"] = value_log_prob
         log_probs["decision"] = decision_log_prob
-        
-        # Combine into action array [color, position, value, decision]
-        action_array = torch.stack([
+
+        # Combine into action array [color, position, value, decision(, joker)]
+        action_components = [
             actions["color"],
             actions["position"],
             actions["value"],
             actions["decision"]
-        ], dim=-1).cpu().numpy()
-        
+        ]
+
+        if joker_logits is not None:
+            joker_action, joker_log_prob = self._sample_from_logits(joker_logits, deterministic)
+            actions["joker"] = joker_action
+            log_probs["joker"] = joker_log_prob
+            action_components.append(joker_action)
+
+        action_array = torch.stack(action_components, dim=-1).cpu().numpy()
+
         return action_array, log_probs, value
     
     def _sample_from_logits(
@@ -874,8 +977,8 @@ class DaVinciCodePolicy(nn.Module):
         phase = obs["phase"]
         
         # Encode and get features
-        features, constraint_per_pos, opponent_per_pos = self.encoder(obs)
-        
+        features, constraint_per_pos, opponent_per_pos, my_per_pos = self._encode(obs)
+
         # Enrich opponent features with belief predictions (also returns logits for CE loss)
         enriched_opp, belief_logits = self._enrich_opp_with_belief(features, opponent_per_pos)
 
@@ -885,7 +988,8 @@ class DaVinciCodePolicy(nn.Module):
             phase.float(),
             action_mask,
             selected_position=actions["position"],  # Use actual position taken
-            opponent_per_pos=enriched_opp
+            opponent_per_pos=enriched_opp,
+            my_per_pos=my_per_pos
         )
 
         # Get state value

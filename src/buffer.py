@@ -247,20 +247,23 @@ class RolloutBuffer:
             np.array([t.player_id for t in self.transitions])
         ).long().to(self.device)
         
-        # Cache actions — ACTION_KEYS defines index ↔ name mapping
+        # Cache actions — ACTION_KEYS defines index ↔ name mapping.
+        # Slice by the actual action length: legacy envs emit 4 components,
+        # joker_control envs emit 5 ("joker" insert index).
+        active_keys = ACTION_KEYS[:len(self.transitions[0].action)]
         self._cache['actions'] = {
             key: torch.from_numpy(
                 np.array([self.transitions[i].action[k_idx] for i in range(n)])
             ).long().to(self.device)
-            for k_idx, key in enumerate(ACTION_KEYS)
+            for k_idx, key in enumerate(active_keys)
         }
-        
+
         # Cache old log probs
         self._cache['log_probs'] = {
             key: torch.from_numpy(
                 np.array([self.transitions[i].log_probs.get(key, 0.0) for i in range(n)])
             ).float().to(self.device)
-            for key in ACTION_KEYS
+            for key in active_keys
         }
         
         # Cache action masks

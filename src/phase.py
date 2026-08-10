@@ -31,6 +31,23 @@ class PhaseCycle:
         self._require(Phase.DRAW)
         self._phase = Phase.GUESS
 
+    def draw_joker(self) -> None:
+        """A joker was drawn (joker_control mode): place it before guessing."""
+        self._require(Phase.DRAW)
+        self._phase = Phase.JOKER
+
+    # ===== JOKER =====
+
+    def joker_placed(self) -> None:
+        """Drawn joker placed → proceed to guess."""
+        self._require(Phase.JOKER)
+        self._phase = Phase.GUESS
+
+    def initial_placement_done(self) -> None:
+        """All initial jokers placed → game proper starts with a draw."""
+        self._require(Phase.JOKER)
+        self._phase = Phase.DRAW
+
     # ===== GUESS =====
 
     def guess_correct(self) -> None:

@@ -19,7 +19,8 @@ from src.env import DaVinciCodeEnv
 # ============================================================
 # Worker process function for SubprocVecEnv
 # ============================================================
-def _worker_loop(pipe, parent_pipe, n_local_envs, seed_base, reward_config=None):
+def _worker_loop(pipe, parent_pipe, n_local_envs, seed_base, reward_config=None,
+                 joker_control=False):
     """
     Main loop for a worker process.
     Each worker manages n_local_envs environments.
@@ -27,7 +28,8 @@ def _worker_loop(pipe, parent_pipe, n_local_envs, seed_base, reward_config=None)
     parent_pipe.close()
     
     envs = [
-        DaVinciCodeEnv(seed=seed_base + i if seed_base is not None else None, reward_config=reward_config)
+        DaVinciCodeEnv(seed=seed_base + i if seed_base is not None else None, reward_config=reward_config,
+                       joker_control=joker_control)
         for i in range(n_local_envs)
     ]
     
@@ -95,8 +97,9 @@ class SubprocVecEnv:
     """
     
     def __init__(self, n_envs: int = 2000, seed: Optional[int] = None, n_workers: Optional[int] = None,
-                 reward_config=None) -> None:
+                 reward_config=None, joker_control: bool = False) -> None:
         self.reward_config = reward_config
+        self.joker_control = joker_control
         self.n_envs = n_envs
         self.n_workers = n_workers or min(os.cpu_count() * 2 or 4, max(1, n_envs // 30))
         self.n_workers = max(1, min(self.n_workers, n_envs))
@@ -127,7 +130,8 @@ class SubprocVecEnv:
             
             worker = ctx.Process(
                 target=_worker_loop,
-                args=(child_conn, parent_conn, n_local, worker_seed, reward_config),
+                args=(child_conn, parent_conn, n_local, worker_seed, reward_config,
+                      joker_control),
                 daemon=True
             )
             worker.start()
@@ -138,7 +142,8 @@ class SubprocVecEnv:
             seed_offset += n_local
         
         # Local env for visualization only (not used in training)
-        self._viz_env = DaVinciCodeEnv(seed=seed if seed is not None else None, reward_config=reward_config)
+        self._viz_env = DaVinciCodeEnv(seed=seed if seed is not None else None, reward_config=reward_config,
+                                       joker_control=joker_control)
         
         print(f"SubprocVecEnv: {n_envs} envs across {self.n_workers} workers "
               f"({self.envs_per_worker[0]}-{self.envs_per_worker[-1]} envs/worker)")
@@ -261,10 +266,12 @@ class VectorDaVinciEnv:
     """
     
     def __init__(self, n_envs: int = 8, seed: Optional[int] = None, use_threads: bool = True,
-                 reward_config=None) -> None:
+                 reward_config=None, joker_control: bool = False) -> None:
         self.n_envs = n_envs
+        self.joker_control = joker_control
         self.envs = [
-            DaVinciCodeEnv(seed=seed + i if seed is not None else None, reward_config=reward_config)
+            DaVinciCodeEnv(seed=seed + i if seed is not None else None, reward_config=reward_config,
+                           joker_control=joker_control)
             for i in range(n_envs)
         ]
         

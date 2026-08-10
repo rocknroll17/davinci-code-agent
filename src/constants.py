@@ -9,6 +9,7 @@ class Phase(IntEnum):
     DRAW = 0
     GUESS = 1
     DECISION = 2
+    JOKER = 3  # joker placement (only reachable when joker_control is enabled)
 
 
 class Color(IntEnum):
@@ -91,7 +92,15 @@ MAX_PLAYERS: Final[int] = 2
 
 # Action space: ordered tuple of action component names.
 # Indices must match the action array layout used throughout training.
-ACTION_KEYS: Final[tuple] = ("color", "position", "value", "decision")
+# "joker" (insert position for a drawn/initial joker) only exists when the env
+# is created with joker_control=True; legacy action arrays are length 4 and
+# consumers slice ACTION_KEYS by the actual action length.
+ACTION_KEYS: Final[tuple] = ("color", "position", "value", "decision", "joker")
+LEGACY_ACTION_KEYS: Final[tuple] = ACTION_KEYS[:4]
+
+# Phase one-hot sizes for the two observation variants
+N_PHASES_LEGACY: Final[int] = 3
+N_PHASES_JOKER: Final[int] = 4
 
 # Default checkpoint paths (relative to the training directory)
 CHECKPOINT_DIR: Final[str] = "checkpoints"

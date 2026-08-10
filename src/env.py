@@ -50,6 +50,14 @@ class DaVinciCodeEnv(gym.Env):
         - position: 0-12 (used in GUESS phase)
         - value: 0-12 (used in GUESS phase)
         - decision: 0=STOP, 1=CONTINUE (used in DECISION phase)
+
+    joker_control=True variant:
+        Jokers are no longer placed randomly. A drawn joker (and each joker in
+        the initial deal) triggers a JOKER phase where the owning player chooses
+        the insert index in their own hand via a 5th action component:
+        - joker: 0-12 insert index (used in JOKER phase)
+        Phase one-hot grows to (4,) and the action space to
+        MultiDiscrete([2, 13, 13, 2, 13]).
     """
     
     metadata = {"render_modes": ["human", "ansi"], "name": "DaVinciCode-v0"}
@@ -60,6 +68,7 @@ class DaVinciCodeEnv(gym.Env):
         seed: Optional[int] = None,
         viewer: Optional[int] = VIEWER,
         reward_config: Optional["RewardConfig"] = None,
+        joker_control: bool = False,
     ) -> None:
         """
         Initialize the Da Vinci Code environment.
@@ -70,11 +79,15 @@ class DaVinciCodeEnv(gym.Env):
             reward_config: Reward magnitudes. Defaults to RewardConfig() which
                 equals the historical constants — so behaviour is unchanged when
                 not supplied.
+            joker_control: If True, joker placement is an agent action (JOKER
+                phase + 5th action component) instead of random insertion.
         """
         super().__init__()
 
         self.render_mode = render_mode
         self._seed = seed
+        self.joker_control = joker_control
+        self._n_phases = 4 if joker_control else 3
         # Reward magnitudes (None → defaults identical to the old global constants).
         self._rc = reward_config if reward_config is not None else RewardConfig()
         # Monotone reward mode (set via env var so it propagates to forked workers):
@@ -87,7 +100,7 @@ class DaVinciCodeEnv(gym.Env):
         # Define observation space
         self.observation_space = spaces.Dict({
             "phase": spaces.Box(
-                low=0, high=1, shape=(3,), dtype=np.int8
+                low=0, high=1, shape=(self._n_phases,), dtype=np.int8
             ),
             "my_hand": spaces.Box(
                 low=-2, high=12, shape=(MAX_HAND_SIZE, 2), dtype=np.int8
@@ -103,8 +116,11 @@ class DaVinciCodeEnv(gym.Env):
             )
         })
         
-        # Define action space: [color, position, value, decision]
-        self.action_space = spaces.MultiDiscrete([2, 13, 13, 2])
+        # Define action space: [color, position, value, decision(, joker)]
+        if joker_control:
+            self.action_space = spaces.MultiDiscrete([2, 13, 13, 2, 13])
+        else:
+            self.action_space = spaces.MultiDiscrete([2, 13, 13, 2])
         
         # Initialize game state variables
         self._deck: Deck = Deck(seed)
@@ -116,6 +132,12 @@ class DaVinciCodeEnv(gym.Env):
         self._last_drawn_position: int = -1
         self._done: bool = False
         self._winner: Optional[int] = None
+
+        # joker_control: queue of (player_id, joker_card) awaiting placement.
+        # Non-empty during the initial-placement stage and for one step after a
+        # joker is drawn.
+        self._pending_jokers: list[tuple[int, Card]] = []
+        self._initial_placement: bool = False
 
         # Track last action for rendering
         self._last_action: Optional[np.ndarray] = None
@@ -162,7 +184,15 @@ class DaVinciCodeEnv(gym.Env):
         self._winner = None
         self._last_action = None
         self._last_reward = 0.0
-        
+
+        # joker_control: initial jokers were withheld from the deal — each owner
+        # places theirs via a JOKER-phase action before the first draw.
+        self._initial_placement = False
+        if self._pending_jokers:
+            self._initial_placement = True
+            self._current_player = self._pending_jokers[0][0]
+            self._phase = PhaseCycle(start=Phase.JOKER)
+
         return self._get_observation(), self._get_info()
     
     def render_info(self) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
@@ -175,11 +205,29 @@ class DaVinciCodeEnv(gym.Env):
         return self._get_render_observation(), self._get_render_info()
     
     def _deal_initial_cards(self) -> None:
-        """Deal initial cards to both players."""
+        """Deal initial cards to both players.
+
+        joker_control mode: jokers are NOT auto-inserted — they go into
+        ``self._pending_jokers`` and are placed by agent actions at game start.
+        The opponent's constraint matrix starts with only the placed (normal)
+        cards; each joker placement inserts an unknown row via update_constraint,
+        mirroring how mid-game inserts are tracked.
+        """
+        self._pending_jokers = []
         for player in range(2):
             cards = self._deck.initial_draw(INITIAL_HAND_SIZE_2P)
-            self.players[player]._hand.add_initial_cards(cards)
-            self.players[player].update_initial_constraint(INITIAL_HAND_SIZE_2P)
+            pending = self.players[player]._hand.add_initial_cards(
+                cards, auto_place_jokers=not self.joker_control
+            )
+            for joker in pending:
+                self._pending_jokers.append((player, joker))
+        # A player's constraint matrix tracks the OPPONENT's hand — initialize
+        # rows to the opponent's currently-placed card count. (Symmetric 4/4 in
+        # legacy mode; can be 3 or 4 in joker_control mode until jokers land.)
+        for player in range(2):
+            self.players[player].update_initial_constraint(
+                self.players[1 - player]._hand.size
+            )
         logger.info("Player 0 starts turn.")
 
     def step(
@@ -221,6 +269,8 @@ class DaVinciCodeEnv(gym.Env):
             result = self._handle_guess_phase(action)
         elif self._phase == Phase.DECISION:
             result = self._handle_decision_phase(action)
+        elif self._phase == Phase.JOKER:
+            result = self._handle_joker_phase(action)
 
         step_reward = result.reward if result is not None else 0.0 # Get reward from the result object
         
@@ -254,7 +304,7 @@ class DaVinciCodeEnv(gym.Env):
         """
         pov = viewer if viewer is not None else self._current_player
         opponent = 1 - pov
-        phase_onehot = np.zeros(3, dtype=np.int8)
+        phase_onehot = np.zeros(self._n_phases, dtype=np.int8)
         phase_onehot[self._phase.value] = 1
         return {
             "phase": phase_onehot,
@@ -299,7 +349,16 @@ class DaVinciCodeEnv(gym.Env):
         card = self._draw_card(color)
         if card is None:
             return DrawResult(self._current_player, self._rc.invalid_action, None, None, is_invalid=True)
-        
+
+        # joker_control: a drawn joker is NOT inserted here — the agent chooses
+        # the insert index in the JOKER phase that follows.
+        if self.joker_control and card.is_joker:
+            self._pending_jokers.append((self._current_player, card))
+            self._last_drawn_card = card
+            self._last_drawn_position = -1
+            self._phase.draw_joker()
+            return DrawResult(self._current_player, 0.0, card, None, is_invalid=False)
+
         # Add to current player's hand
         position = self.players[self._current_player]._hand.add_card(card)
         # file = open(f"logs/card_log_{self._current_player}.txt", "a")
@@ -465,6 +524,55 @@ class DaVinciCodeEnv(gym.Env):
         
         return reward
     
+    def _handle_joker_phase(self, action: np.ndarray) -> "JokerPlaceResult":
+        """
+        Handle JOKER phase action (joker_control mode only).
+
+        The current player chooses the insert index for the pending joker in
+        their OWN hand. Valid indices are 0..hand.size (the action mask exposes
+        exactly these); out-of-range values are clamped as a safety net.
+
+        Covers two cases with one flow:
+        - initial placement (game-start jokers, possibly several in a queue)
+        - a joker drawn in the DRAW phase (single entry, → GUESS afterwards)
+        """
+        from src.result.joker_result import JokerPlaceResult
+
+        player, card = self._pending_jokers.pop(0)
+        hand = self.players[player]._hand
+        max_pos = min(hand.size, MAX_HAND_SIZE - 1)
+        chosen = min(max(int(action[4]), 0), max_pos)
+
+        insert_pos = hand.add_card(card, joker_position=chosen)
+        self._last_drawn_card = card
+        self._last_drawn_position = insert_pos
+        # The opponent sees a card slide into the placer's hand at insert_pos.
+        self.players[1 - player].update_constraint(insert_pos)
+
+        result = JokerPlaceResult(
+            player, 0.0, card, insert_pos,
+            is_initial=self._initial_placement, is_invalid=False
+        )
+        logger.info(result)
+
+        if self._pending_jokers:
+            # More initial jokers to place (phase stays JOKER).
+            self._current_player = self._pending_jokers[0][0]
+        elif self._initial_placement:
+            # Initial stage complete → player 0 opens with a draw.
+            self._initial_placement = False
+            for p in self.players:
+                p._hand.last_drawn_card = None
+            self._last_drawn_card = None
+            self._last_drawn_position = -1
+            self._current_player = 0
+            self._phase.initial_placement_done()
+        else:
+            # Drawn joker placed → the normal guess follows.
+            self._phase.joker_placed()
+
+        return result
+
     def _handle_decision_phase(self, action: np.ndarray) -> StreakResult:
         """
         Handle DECISION phase action.
@@ -634,13 +742,23 @@ class DaVinciCodeEnv(gym.Env):
         
         # Decision mask
         decision_mask = np.array([True, True], dtype=bool)  # STOP, CONTINUE
-        
-        return {
+
+        masks = {
             "color": color_mask,
             "position": position_mask,
             "value": value_mask,
             "decision": decision_mask
         }
+
+        if self.joker_control:
+            # Joker insert mask: indices 0..hand.size of the CURRENT player's
+            # own hand (insert-before semantics; hand.size = append at end).
+            hand = self.players[self._current_player]._hand
+            joker_mask = np.zeros(MAX_HAND_SIZE, dtype=bool)
+            joker_mask[:min(hand.size + 1, MAX_HAND_SIZE)] = True
+            masks["joker"] = joker_mask
+
+        return masks
     
     def render(self) -> Optional[str]:
         """

@@ -93,7 +93,11 @@ class ModelAgent:
         hidden_dim = cfg.get("hidden_dim") or hidden_dim
         n_heads = cfg.get("n_heads") or n_heads
         n_layers = cfg.get("n_layers") or n_layers
-        policy = DaVinciCodePolicy(hidden_dim=hidden_dim, n_heads=n_heads, n_layers=n_layers).to(device)
+        # joker_control checkpoints need the 4-phase encoder + joker head;
+        # legacy checkpoints (no such key) keep the original architecture.
+        joker_control = bool(cfg.get("joker_control", False))
+        policy = DaVinciCodePolicy(hidden_dim=hidden_dim, n_heads=n_heads, n_layers=n_layers,
+                                   joker_control=joker_control).to(device)
 
         state_dict = checkpoint.get("policy_state_dict", checkpoint)
         # strict=False tolerates architecture additions (e.g. slot_pos_embed) when

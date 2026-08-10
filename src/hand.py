@@ -68,10 +68,16 @@ class Hand(list[Card]):
         candidate_positions = list(range(left_idx + 1, right_idx + 1))
         return random.choice(candidate_positions)
             
-    def add_initial_cards(self, cards: List[Card]) -> None:
+    def add_initial_cards(self, cards: List[Card], auto_place_jokers: bool = True) -> List[Card]:
         """
         초기 카드 세트를 핸드에 추가한다.
         일반 카드(조커 제외)는 정렬해서 먼저 넣고, 조커는 분리해서 랜덤 위치에 삽입한다.
+
+        auto_place_jokers=False (joker_control 모드): 조커는 넣지 않고 반환만 한다.
+        env가 JOKER 페이즈에서 에이전트 액션으로 삽입 위치를 받는다.
+
+        Returns:
+            핸드에 넣지 않은 조커 리스트 (auto_place_jokers=True면 빈 리스트)
         """
         normal_cards = [c for c in cards if not c.is_joker]
         jokers = [c for c in cards if c.is_joker]
@@ -81,11 +87,16 @@ class Hand(list[Card]):
         for card in normal_cards:
             self.add_card(card)
 
-        # 조커는 랜덤 위치에 삽입
-        for joker in jokers:
-            self.add_card(joker)
+        pending: List[Card] = []
+        if auto_place_jokers:
+            # 조커는 랜덤 위치에 삽입
+            for joker in jokers:
+                self.add_card(joker)
+        else:
+            pending = jokers
 
         self.last_drawn_card = None
+        return pending
 
     def _is_valid_position(self, new_card: Card, pos: int) -> bool:
         """새 카드가 pos 위치에 들어갈 수 있는지 확인"""
