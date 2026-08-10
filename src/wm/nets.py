@@ -539,15 +539,21 @@ class WorldModel(nn.Module):
         if valid is not None:
             # zero-padded steps carry no learning signal
             total = (step_loss * valid).sum() / valid.sum().clamp(min=1.0)
+            # metrics must use the same weighting — an unweighted mean is
+            # dominated by the garbage loss on zero-padded steps (~40% of a
+            # window when seq_len > episode length) and reads far too high
+            wmean = lambda x: float(
+                ((x * valid).sum() / valid.sum().clamp(min=1.0)).detach())
         else:
             total = step_loss.mean()
+            wmean = lambda x: float(x.mean().detach())
         metrics = {
             "wm/loss": float(total.detach()),
-            "wm/obs": float(l_obs.mean().detach()),
-            "wm/reward": float(l_rew.mean().detach()),
-            "wm/continue": float(l_cont.mean().detach()),
-            "wm/kl_dyn": float(l_dyn.mean().detach()),
-            "wm/kl_rep": float(l_rep.mean().detach()),
+            "wm/obs": wmean(l_obs),
+            "wm/reward": wmean(l_rew),
+            "wm/continue": wmean(l_cont),
+            "wm/kl_dyn": wmean(l_dyn),
+            "wm/kl_rep": wmean(l_rep),
         }
         return total, states.detach(), metrics
 
