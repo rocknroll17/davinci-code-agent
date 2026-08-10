@@ -50,15 +50,16 @@ def _fake_batch(B=3, T=6):
     is_first = torch.zeros(B, T)
     is_first[:, 0] = 1.0
     valid = torch.ones(B, T)
-    return obs, actions, rewards, conts, is_first, masks, valid
+    flips = (torch.rand(B, T) < 0.3).float()
+    return obs, actions, rewards, conts, is_first, masks, valid, flips
 
 
 def test_world_model_loss_finite_and_backward():
     torch.manual_seed(0)
     wm = WorldModel(TINY)
-    obs, actions, rewards, conts, is_first, masks, valid = _fake_batch()
+    obs, actions, rewards, conts, is_first, masks, valid, flips = _fake_batch()
     loss, states, metrics = wm.loss(obs, actions, rewards, conts, is_first,
-                                    mask_seq=masks, valid=valid)
+                                    mask_seq=masks, valid=valid, flip_seq=flips)
     assert torch.isfinite(loss)
     loss.backward()
     grads = [p.grad for p in wm.parameters() if p.grad is not None]
@@ -77,6 +78,8 @@ def test_imagination_shapes_and_actor_grad():
     assert img["states"].shape == (5, 5, TINY.state_dim)
     assert img["actions"].shape == (4, 5, 5)
     assert img["rewards"].shape == (5, 5)
+    assert img["flips"].shape == (5, 5)
+    assert ((img["flips"] >= 0) & (img["flips"] <= 1)).all()
     # actions respect component ranges
     for i, n in enumerate(ACTION_SIZES):
         assert int(img["actions"][..., i].max()) < n
@@ -87,6 +90,28 @@ def test_imagination_shapes_and_actor_grad():
     lp.sum().backward()
     assert any(p.grad is not None and torch.isfinite(p.grad).all()
                for p in actor.parameters())
+
+
+def test_replay_terminal_frame_and_flips():
+    """Episodes carry flip flags and one terminal frame (dummy action, cont=0)."""
+    from src.wm.replay import EpisodeAccumulator
+    acc = EpisodeAccumulator()
+    obs = {"phase": np.zeros(4), "my_hand": np.zeros((13, 2)),
+           "opponent_hand": np.zeros((13, 2)), "remaining_deck": np.zeros(2),
+           "constraint_matrix": np.zeros((13, 13))}
+    masks = {"color": np.ones(2, bool), "position": np.ones(13, bool),
+             "value": np.ones((13, 13), bool), "decision": np.ones(2, bool),
+             "joker": np.ones(13, bool)}
+    acc.add(obs, np.zeros(5), 0.5, False, masks, flip=0.0)
+    acc.add(obs, np.zeros(5), -0.5, False, masks, flip=1.0)
+    acc.add(obs, np.zeros(5), 10.0, True, masks, flip=0.0)
+    acc.set_terminal(obs)
+    ep = acc.pack()
+    assert len(ep["actions"]) == 4                 # 3 steps + terminal frame
+    assert ep["continues"][-1] == 0.0 and ep["rewards"][-1] == 0.0
+    assert list(ep["flips"][:3]) == [0.0, 1.0, 0.0]
+    # the terminal reward (win) sits at index -2, predicted from the terminal state
+    assert ep["rewards"][-2] == 10.0
 
 
 def test_full_dreamer_loop_tiny():

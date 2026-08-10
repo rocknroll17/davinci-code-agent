@@ -465,6 +465,10 @@ class WorldModel(nn.Module):
         self.reward_head = mlp(cfg.state_dim, cfg.hidden, cfg.n_bins)
         self.continue_head = mlp(cfg.state_dim, cfg.hidden, 1)
         self.mask_head = MaskHead(cfg)
+        # Perspective-flip head: P(acting player changed between s_{t-1} and s_t).
+        # Needed for zero-sum (negamax) returns inside imagination, where the
+        # real env can't tell us whose turn it is.
+        self.flip_head = mlp(cfg.state_dim, cfg.hidden, 1)
         self.twohot = TwoHot(cfg.n_bins)
 
     def to(self, *args, **kwargs):
@@ -519,41 +523,58 @@ class WorldModel(nn.Module):
         is_first: torch.Tensor,          # (B, T)
         mask_seq: Optional[Dict[str, torch.Tensor]] = None,
         valid: Optional[torch.Tensor] = None,   # (B, T) 1.0 for real steps
+        flip_seq: Optional[torch.Tensor] = None,  # (B, T) perspective-change flags
     ):
         post, prior, states = self.observe(obs_seq, action_seq, is_first)
+        B, T = action_seq.shape[:2]
+        if valid is None:
+            valid = torch.ones(B, T, device=states.device)
+
+        def wmean(x, w):
+            return (x * w).sum() / w.sum().clamp(min=1.0)
 
         dec = self.decoder(states)
-        l_obs = ObsDecoder.loss(dec, obs_seq)                                # (B, T)
-        l_rew = self.twohot.loss(self.reward_head(states), reward_seq)       # (B, T)
+        obs_m = wmean(ObsDecoder.loss(dec, obs_seq), valid)
+
+        # Reward/continue are consequences of a_t, but a_t is only encoded in
+        # the NEXT state (h_{t+1} = f(h_t, z_t, a_t)) — training them on s_t
+        # would ask the model to predict an outcome of an action it hasn't
+        # seen. Train on the arriving state instead; the terminal frame the
+        # replay appends makes the final win/lose reward learnable too.
+        valid2 = valid[:, 1:] * valid[:, :-1]
+        states_next = states[:, 1:]
+        l_rew = self.twohot.loss(self.reward_head(states_next), reward_seq[:, :-1])
         l_cont = F.binary_cross_entropy_with_logits(
-            self.continue_head(states).squeeze(-1), continue_seq, reduction="none")
-        l_pred = l_obs + l_rew + l_cont
+            self.continue_head(states_next).squeeze(-1), continue_seq[:, :-1],
+            reduction="none")
+        rew_m = wmean(l_rew, valid2)
+        cont_m = wmean(l_cont, valid2)
+
+        pred_m = obs_m + rew_m + cont_m
         if mask_seq is not None:
-            l_pred = l_pred + MaskHead.loss(self.mask_head(states), mask_seq)
+            pred_m = pred_m + wmean(MaskHead.loss(self.mask_head(states), mask_seq), valid)
+        flip_m = torch.tensor(0.0, device=states.device)
+        if flip_seq is not None:
+            l_flip = F.binary_cross_entropy_with_logits(
+                self.flip_head(states).squeeze(-1), flip_seq, reduction="none")
+            flip_m = wmean(l_flip, valid)
+            pred_m = pred_m + flip_m
 
         l_dyn, l_rep = self.rssm.kl_losses(post, prior)
+        dyn_m = wmean(l_dyn, valid)
+        rep_m = wmean(l_rep, valid)
 
-        step_loss = (self.cfg.beta_pred * l_pred
-                     + self.cfg.beta_dyn * l_dyn
-                     + self.cfg.beta_rep * l_rep)
-        if valid is not None:
-            # zero-padded steps carry no learning signal
-            total = (step_loss * valid).sum() / valid.sum().clamp(min=1.0)
-            # metrics must use the same weighting — an unweighted mean is
-            # dominated by the garbage loss on zero-padded steps (~40% of a
-            # window when seq_len > episode length) and reads far too high
-            wmean = lambda x: float(
-                ((x * valid).sum() / valid.sum().clamp(min=1.0)).detach())
-        else:
-            total = step_loss.mean()
-            wmean = lambda x: float(x.mean().detach())
+        total = (self.cfg.beta_pred * pred_m
+                 + self.cfg.beta_dyn * dyn_m
+                 + self.cfg.beta_rep * rep_m)
         metrics = {
             "wm/loss": float(total.detach()),
-            "wm/obs": wmean(l_obs),
-            "wm/reward": wmean(l_rew),
-            "wm/continue": wmean(l_cont),
-            "wm/kl_dyn": wmean(l_dyn),
-            "wm/kl_rep": wmean(l_rep),
+            "wm/obs": float(obs_m.detach()),
+            "wm/reward": float(rew_m.detach()),
+            "wm/continue": float(cont_m.detach()),
+            "wm/flip": float(flip_m.detach()),
+            "wm/kl_dyn": float(dyn_m.detach()),
+            "wm/kl_rep": float(rep_m.detach()),
         }
         return total, states.detach(), metrics
 
@@ -597,6 +618,7 @@ class WorldModel(nn.Module):
         states = torch.stack(states)                 # (H+1, N, S)
         rewards = self.twohot.decode(self.reward_head(states))     # (H+1, N)
         conts = torch.sigmoid(self.continue_head(states)).squeeze(-1)
+        flips = torch.sigmoid(self.flip_head(states)).squeeze(-1)  # P(perspective flipped)
         return {
             "states": states,
             "actions": torch.stack(actions),
@@ -604,4 +626,5 @@ class WorldModel(nn.Module):
             "entropies": torch.stack(entropies),
             "rewards": rewards,
             "continues": conts,
+            "flips": flips,
         }

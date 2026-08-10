@@ -20,7 +20,16 @@ MASK_KEYS = ("color", "position", "value", "decision", "joker")
 
 
 class EpisodeAccumulator:
-    """Collects one env's transitions until the episode ends."""
+    """Collects one env's transitions until the episode ends.
+
+    Per step t it stores (obs_t, a_t, r_t, cont_t, flip_t) where flip_t marks
+    that the acting player CHANGED between step t-1 and t (0 at episode start).
+
+    ``set_terminal`` records the post-game observation; ``pack`` appends it as
+    one extra frame (dummy action, r=0, cont=0). The reward/continue heads are
+    trained on the ARRIVING state s_{t+1}, so without this frame the terminal
+    win/lose reward of the last action would have no state to be predicted from.
+    """
 
     def __init__(self) -> None:
         self.obs: Dict[str, List[np.ndarray]] = {k: [] for k in OBS_KEYS}
@@ -28,8 +37,10 @@ class EpisodeAccumulator:
         self.actions: List[np.ndarray] = []
         self.rewards: List[float] = []
         self.continues: List[float] = []
+        self.flips: List[float] = []
+        self.terminal_obs: Optional[Dict[str, np.ndarray]] = None
 
-    def add(self, obs, action, reward, done, masks) -> None:
+    def add(self, obs, action, reward, done, masks, flip: float = 0.0) -> None:
         for k in OBS_KEYS:
             self.obs[k].append(np.asarray(obs[k]))
         for k in MASK_KEYS:
@@ -37,17 +48,37 @@ class EpisodeAccumulator:
         self.actions.append(np.asarray(action))
         self.rewards.append(float(reward))
         self.continues.append(0.0 if done else 1.0)
+        self.flips.append(float(flip))
+
+    def set_terminal(self, obs) -> None:
+        self.terminal_obs = {k: np.asarray(obs[k]) for k in OBS_KEYS}
 
     def __len__(self) -> int:
         return len(self.actions)
 
     def pack(self) -> Dict:
+        obs = {k: list(v) for k, v in self.obs.items()}
+        masks = {k: list(v) for k, v in self.masks.items()}
+        actions = list(self.actions)
+        rewards = list(self.rewards)
+        continues = list(self.continues)
+        flips = list(self.flips)
+        if self.terminal_obs is not None:
+            for k in OBS_KEYS:
+                obs[k].append(self.terminal_obs[k])
+            for k in MASK_KEYS:
+                masks[k].append(masks[k][-1])   # masks are meaningless post-game
+            actions.append(np.zeros_like(actions[-1]))
+            rewards.append(0.0)
+            continues.append(0.0)
+            flips.append(0.0)
         return {
-            "obs": {k: np.stack(v) for k, v in self.obs.items()},
-            "masks": {k: np.stack(v) for k, v in self.masks.items()},
-            "actions": np.stack(self.actions).astype(np.int64),
-            "rewards": np.asarray(self.rewards, dtype=np.float32),
-            "continues": np.asarray(self.continues, dtype=np.float32),
+            "obs": {k: np.stack(v) for k, v in obs.items()},
+            "masks": {k: np.stack(v) for k, v in masks.items()},
+            "actions": np.stack(actions).astype(np.int64),
+            "rewards": np.asarray(rewards, dtype=np.float32),
+            "continues": np.asarray(continues, dtype=np.float32),
+            "flips": np.asarray(flips, dtype=np.float32),
         }
 
 
@@ -78,7 +109,7 @@ class SequenceReplay:
         L = self.seq_len
         obs_batch = {k: [] for k in OBS_KEYS}
         mask_batch = {k: [] for k in MASK_KEYS}
-        act_b, rew_b, cont_b, first_b, valid_b = [], [], [], [], []
+        act_b, rew_b, cont_b, first_b, valid_b, flip_b = [], [], [], [], [], []
 
         for _ in range(batch_size):
             ep = self.rng.choice(self.episodes)
@@ -101,6 +132,7 @@ class SequenceReplay:
                 mask_batch[k].append(take(ep["masks"][k]))
             act_b.append(take(ep["actions"]))
             rew_b.append(take(ep["rewards"]))
+            flip_b.append(take(ep.get("flips", np.zeros(T, dtype=np.float32))))
             cont = take(ep["continues"])
             if pad:
                 cont[n:] = 0.0
@@ -120,6 +152,7 @@ class SequenceReplay:
             "actions": to(act_b, torch.int64),
             "rewards": to(rew_b),
             "continues": to(cont_b),
+            "flips": to(flip_b),
             "is_first": to(first_b),
             "valid": to(valid_b),
         }

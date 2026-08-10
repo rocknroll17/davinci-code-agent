@@ -114,6 +114,7 @@ class DreamerTrainer:
         self._prev_action = None
         self._accs = [EpisodeAccumulator() for _ in range(config.n_envs)]
         self._obs = None
+        self._last_player = [None] * config.n_envs   # for perspective-flip flags
 
         self._return_scale = 1.0
         self.total_env_steps = 0
@@ -146,6 +147,7 @@ class DreamerTrainer:
         self._prev_action = torch.zeros(n, 5, dtype=torch.long, device=self.device)
         self._obs, _ = self.vec_env.reset()
         self._accs = [EpisodeAccumulator() for _ in range(n)]
+        self._last_player = [None] * n
 
     @torch.no_grad()
     def collect(self, n_episodes: int, random_actor: bool = False) -> Dict[str, float]:
@@ -173,21 +175,32 @@ class DreamerTrainer:
                 action, _, _ = self.actor.sample(state, masks_t, phase_idx)
             action_np = action.cpu().numpy()
 
-            next_obs, rewards, terminated, truncated, infos, _ = self.vec_env.step(action_np)
+            next_obs, rewards, terminated, truncated, infos, results = self.vec_env.step(action_np)
             dones = terminated | truncated
             self.total_env_steps += self.cfg.n_envs
 
             for i in range(self.cfg.n_envs):
+                # perspective flip = the acting player changed vs the previous step
+                pid = int(results[i].player_id) if (
+                    results[i] is not None and hasattr(results[i], "player_id")) else 0
+                flip = 0.0 if self._last_player[i] is None else float(pid != self._last_player[i])
+                self._last_player[i] = pid
+
                 self._accs[i].add(
                     {k: self._obs[k][i] for k in self._obs},
                     action_np[i], rewards[i], bool(dones[i]),
                     {k: masks_np[k][i] for k in masks_np},
+                    flip=flip,
                 )
                 if dones[i]:
                     ep = self._accs[i]
+                    # terminal observation BEFORE the reset obs overwrites it —
+                    # the reward head learns the win/lose reward from this frame
+                    ep.set_terminal({k: np.array(next_obs[k][i], copy=True) for k in next_obs})
                     ep_rewards.append(float(sum(ep.rewards)))
                     self.replay.add_episode(ep.pack())
                     self._accs[i] = EpisodeAccumulator()
+                    self._last_player[i] = None
                     done_episodes += 1
                     self.total_episodes += 1
                     # reset env + recurrent state for this slot
@@ -231,6 +244,7 @@ class DreamerTrainer:
         loss, states, metrics = self.wm.loss(
             batch["obs"], batch["actions"], batch["rewards"], batch["continues"],
             batch["is_first"], mask_seq=batch["masks"], valid=batch["valid"],
+            flip_seq=batch["flips"],
         )
         self.wm_opt.zero_grad()
         loss.backward()
@@ -265,13 +279,20 @@ class DreamerTrainer:
 
             v_ema = self.wm.twohot.decode(self.critic_ema(s_all))   # (H+1, N)
 
-            # λ-returns (bootstrapped with the EMA critic)
+            # Zero-sum (negamax) λ-returns. Every state is "current player's
+            # perspective"; the critic values it for the player to act there.
+            # When the perspective flips between s_t and s_{t+1}, the future
+            # value/return is the OPPONENT's and must be negated — otherwise
+            # the actor maximizes both players' rewards summed together.
+            # rewards[t+1] is r(a_t), already from s_t's actor's perspective.
+            # sign is soft: E[±1] = 1 − 2·P(flip).
+            sign = 1.0 - 2.0 * img["flips"]                         # (H+1, N)
             H = cfg.horizon
             returns = torch.zeros_like(v_ema)
             returns[H] = v_ema[H]
             for t in reversed(range(H)):
                 boot = (1 - cfg.lam) * v_ema[t + 1] + cfg.lam * returns[t + 1]
-                returns[t] = rewards[t + 1] + cfg.gamma * conts[t + 1] * boot
+                returns[t] = rewards[t + 1] + cfg.gamma * conts[t + 1] * sign[t + 1] * boot
 
             # trajectory weights: stop crediting after predicted episode end
             w = torch.cumprod(
@@ -327,6 +348,7 @@ class DreamerTrainer:
             "ac/critic_loss": float(critic_loss.detach()),
             "ac/return_mean": float(returns.mean()),
             "ac/return_scale": float(self._return_scale),
+            "ac/adv_std": float(advantage.std()),
             "ac/entropy": float(entropy.mean().detach()),
         }
 
@@ -434,7 +456,11 @@ class DreamerTrainer:
 
     def load(self, path: str) -> None:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.wm.load_state_dict(ckpt["wm"])
+        # strict=False: checkpoints predating a head (e.g. flip_head) still load;
+        # the missing head starts fresh while everything else warm-starts.
+        missing, unexpected = self.wm.load_state_dict(ckpt["wm"], strict=False)
+        if missing and self.is_main:
+            print(f"[dreamer] new WM parameters initialized fresh: {missing}")
         self.actor.load_state_dict(ckpt["actor"])
         self.critic.load_state_dict(ckpt["critic"])
         self.critic_ema.load_state_dict(ckpt["critic_ema"])
