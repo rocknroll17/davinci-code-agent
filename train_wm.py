@@ -6,6 +6,15 @@ Da Vinci Code world-model (DreamerV3-style) training.
     python train_wm.py --rounds 500        # 수집 라운드 수 지정
     python train_wm.py --resume            # checkpoints_wm/dreamer_latest.pt 이어서
     python train_wm.py --small             # CPU 스모크용 소형 모델
+    python train_wm.py --large             # 24GB GPU용 논문 크기 (32x32 latents)
+
+Multi-GPU (one process per GPU, gradients averaged across ranks):
+
+    torchrun --standalone --nproc_per_node=2 train_wm.py --large --envs 64
+
+Each rank collects with its own envs/replay (per-rank seeds) and the models
+stay synchronized via gradient all-reduce (same convention as train_ddp.py).
+Pin GPUs with CUDA_VISIBLE_DEVICES=2,3 if some devices are busy.
 
 The agent is trained entirely from imagined rollouts inside a learned RSSM;
 the real (joker_control) environment is only used to collect replay data.
@@ -15,6 +24,7 @@ import argparse
 import os
 
 import torch
+import torch.distributed as dist
 
 import src.utils.logger  # noqa: F401
 from src.wm.dreamer import DreamerConfig, DreamerTrainer
@@ -34,10 +44,30 @@ def main() -> None:
     ap.add_argument("--updates", type=int, default=None,
                     help="WM and AC updates per collection round")
     ap.add_argument("--episodes-per-round", type=int, default=None)
+    ap.add_argument("--prefill", type=int, default=None,
+                    help="random prefill episodes per rank")
     ap.add_argument("--seed", type=int, default=None)
     args = ap.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # torchrun env (defaults keep plain `python train_wm.py` single-process)
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    # All ranks must agree on device kind + backend: use GPUs only when every
+    # rank can have its own (otherwise fall back to CPU/gloo, e.g. local tests).
+    use_cuda = torch.cuda.is_available() and world_size <= torch.cuda.device_count()
+    if use_cuda:
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cpu")
+
+    if world_size > 1:
+        dist.init_process_group(backend="nccl" if use_cuda else "gloo")
+        # DDP + seed: give ranks different data but deterministic per rank
+        if args.seed is None:
+            args.seed = 0
 
     wm_cfg = WMConfig()
     if args.small:
@@ -66,17 +96,25 @@ def main() -> None:
         cfg.ac_updates_per_round = args.updates
     if args.episodes_per_round is not None:
         cfg.episodes_per_round = args.episodes_per_round
-    trainer = DreamerTrainer(cfg, device)
+    if args.prefill is not None:
+        cfg.prefill_episodes = args.prefill
+    trainer = DreamerTrainer(cfg, device, rank=rank, world_size=world_size)
 
     ckpt = os.path.join(cfg.save_dir, "dreamer_latest.pt")
     if args.resume and os.path.exists(ckpt):
         trainer.load(ckpt)
-        print(f"Resumed from {ckpt} (steps={trainer.total_env_steps:,})")
+        if trainer.is_main:
+            print(f"Resumed from {ckpt} (steps={world_size * trainer.total_env_steps:,})")
 
-    print(f"Device: {device} | params: "
-          f"wm={sum(p.numel() for p in trainer.wm.parameters()):,}, "
-          f"actor={sum(p.numel() for p in trainer.actor.parameters()):,}")
-    trainer.train(rounds=args.rounds)
+    if trainer.is_main:
+        print(f"Device: {device} (world_size={world_size}) | params: "
+              f"wm={sum(p.numel() for p in trainer.wm.parameters()):,}, "
+              f"actor={sum(p.numel() for p in trainer.actor.parameters()):,}")
+    try:
+        trainer.train(rounds=args.rounds)
+    finally:
+        if world_size > 1:
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

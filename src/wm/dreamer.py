@@ -24,6 +24,7 @@ from typing import Dict, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from src.model import obs_to_tensor, action_mask_to_tensor
@@ -63,13 +64,31 @@ class DreamerConfig:
 
 
 class DreamerTrainer:
-    def __init__(self, config: DreamerConfig, device: Optional[torch.device] = None) -> None:
+    """Single-GPU by default; multi-GPU data-parallel when constructed with
+    rank/world_size under an initialized torch.distributed process group
+    (manual gradient all-reduce, same convention as PPOTrainer)."""
+
+    def __init__(self, config: DreamerConfig, device: Optional[torch.device] = None,
+                 rank: int = 0, world_size: int = 1) -> None:
         self.cfg = config
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.rank = rank
+        self.world_size = world_size
+        self.is_main = (rank == 0)
+        if world_size > 1 and not dist.is_initialized():
+            raise RuntimeError("world_size>1 requires torch.distributed to be initialized")
 
         self.wm = WorldModel(config.wm).to(self.device)
         self.actor = Actor(config.wm).to(self.device)
         self.critic = Critic(config.wm).to(self.device)
+
+        # DDP: every rank must start from IDENTICAL weights (grad averaging only
+        # keeps replicas in sync if they begin in sync) → broadcast rank 0's.
+        if world_size > 1:
+            for module in (self.wm, self.actor, self.critic):
+                for p in module.parameters():
+                    dist.broadcast(p.data, src=0)
+
         self.critic_ema = copy.deepcopy(self.critic)
         for p in self.critic_ema.parameters():
             p.requires_grad_(False)
@@ -78,8 +97,10 @@ class DreamerTrainer:
         self.ac_opt = torch.optim.Adam(
             list(self.actor.parameters()) + list(self.critic.parameters()), lr=config.ac_lr)
 
-        self.replay = SequenceReplay(config.replay_capacity, config.seq_len, seed=config.seed)
-        self.vec_env = VectorDaVinciEnv(n_envs=config.n_envs, seed=config.seed,
+        # Per-rank seed offset so DDP ranks collect DIFFERENT games.
+        rank_seed = None if config.seed is None else config.seed + rank * 100000
+        self.replay = SequenceReplay(config.replay_capacity, config.seq_len, seed=rank_seed)
+        self.vec_env = VectorDaVinciEnv(n_envs=config.n_envs, seed=rank_seed,
                                         joker_control=True)
 
         # persistent collection state (per env): recurrent state + accumulators
@@ -91,7 +112,21 @@ class DreamerTrainer:
         self._return_scale = 1.0
         self.total_env_steps = 0
         self.total_episodes = 0
-        os.makedirs(config.save_dir, exist_ok=True)
+        if self.is_main:
+            os.makedirs(config.save_dir, exist_ok=True)
+
+    def _all_reduce_grads(self, params) -> None:
+        """Average gradients across ranks. Zero-fill missing grads so every
+        rank reduces the same tensor set in the same order (no deadlock)."""
+        if self.world_size <= 1:
+            return
+        for p in params:
+            if not p.requires_grad:
+                continue
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+            p.grad.div_(self.world_size)
 
     # ------------------------------------------------------------------
     # Collection (real environment)
@@ -188,6 +223,7 @@ class DreamerTrainer:
         )
         self.wm_opt.zero_grad()
         loss.backward()
+        self._all_reduce_grads(self.wm.parameters())
         torch.nn.utils.clip_grad_norm_(self.wm.parameters(), self.cfg.max_grad_norm)
         self.wm_opt.step()
         self._last_states = (states, batch["valid"])   # reused as imagination starts
@@ -204,7 +240,9 @@ class DreamerTrainer:
         states, valid = self._last_states
         start = states.flatten(0, 1)[valid.flatten() > 0]          # (N, S)
         if start.shape[0] == 0:
-            return {}
+            # practically unreachable (every sampled episode has ≥2 real steps);
+            # DDP-safe fallback: still run backward so grad all-reduce stays matched
+            start = torch.zeros(1, states.shape[-1], device=states.device)
 
         with torch.no_grad():
             img = self.wm.imagine(self.actor, start, cfg.horizon)
@@ -228,6 +266,10 @@ class DreamerTrainer:
             # return normalization S = Per(R,95) − Per(R,5), EMA-smoothed
             scale = torch.quantile(returns[:-1].flatten(), 0.95) - \
                 torch.quantile(returns[:-1].flatten(), 0.05)
+            if self.world_size > 1:
+                # keep the scale identical on every rank
+                dist.all_reduce(scale, op=dist.ReduceOp.SUM)
+                scale = scale / self.world_size
             self._return_scale = (cfg.return_norm_decay * self._return_scale
                                   + (1 - cfg.return_norm_decay) * float(scale))
             advantage = (returns[:-1] - v_ema[:-1]) / max(1.0, self._return_scale)
@@ -254,6 +296,8 @@ class DreamerTrainer:
         loss = actor_loss + critic_loss
         self.ac_opt.zero_grad()
         loss.backward()
+        self._all_reduce_grads(
+            list(self.actor.parameters()) + list(self.critic.parameters()))
         torch.nn.utils.clip_grad_norm_(
             list(self.actor.parameters()) + list(self.critic.parameters()),
             cfg.max_grad_norm)
@@ -278,9 +322,12 @@ class DreamerTrainer:
 
     def train(self, rounds: int, log_every: int = 1) -> None:
         # prefill with masked-random play so the world model sees diverse states
+        # (every rank prefills its own replay — DDP ranks hold disjoint data)
         if self.replay.n_episodes < self.cfg.prefill_episodes:
-            print(f"[dreamer] prefilling replay with "
-                  f"{self.cfg.prefill_episodes - self.replay.n_episodes} random episodes...")
+            if self.is_main:
+                print(f"[dreamer] prefilling replay with "
+                      f"{self.cfg.prefill_episodes - self.replay.n_episodes} "
+                      f"random episodes/rank...")
             self.collect(self.cfg.prefill_episodes - self.replay.n_episodes,
                          random_actor=True)
 
@@ -293,16 +340,18 @@ class DreamerTrainer:
             for _ in range(self.cfg.ac_updates_per_round):
                 ac_m = self.train_actor_critic()
 
-            if r % log_every == 0:
-                print(f"[dreamer] round {r} | steps {self.total_env_steps:,} "
-                      f"| eps {self.total_episodes} "
+            if self.is_main and r % log_every == 0:
+                ws = self.world_size
+                print(f"[dreamer] round {r} | steps {ws * self.total_env_steps:,} "
+                      f"| eps {ws * self.total_episodes} "
                       f"| R {cstats['collect/mean_ep_reward']:.2f} "
                       f"| wm {wm_m.get('wm/loss', 0):.2f} "
                       f"(obs {wm_m.get('wm/obs', 0):.2f}, kl {wm_m.get('wm/kl_dyn', 0):.2f}) "
                       f"| actor {ac_m.get('ac/actor_loss', 0):.4f} "
                       f"| critic {ac_m.get('ac/critic_loss', 0):.2f} "
                       f"| ent {ac_m.get('ac/entropy', 0):.2f}")
-            self.save(os.path.join(self.cfg.save_dir, "dreamer_latest.pt"))
+            if self.is_main:
+                self.save(os.path.join(self.cfg.save_dir, "dreamer_latest.pt"))
 
     # ------------------------------------------------------------------
     # Persistence / inference
@@ -316,8 +365,8 @@ class DreamerTrainer:
             "critic_ema": self.critic_ema.state_dict(),
             "wm_opt": self.wm_opt.state_dict(),
             "ac_opt": self.ac_opt.state_dict(),
-            "total_env_steps": self.total_env_steps,
-            "total_episodes": self.total_episodes,
+            "total_env_steps": self.world_size * self.total_env_steps,
+            "total_episodes": self.world_size * self.total_episodes,
             "config": self.cfg.__dict__ | {"wm": self.cfg.wm.__dict__},
         }, path)
 
@@ -329,8 +378,8 @@ class DreamerTrainer:
         self.critic_ema.load_state_dict(ckpt["critic_ema"])
         self.wm_opt.load_state_dict(ckpt["wm_opt"])
         self.ac_opt.load_state_dict(ckpt["ac_opt"])
-        self.total_env_steps = ckpt.get("total_env_steps", 0)
-        self.total_episodes = ckpt.get("total_episodes", 0)
+        self.total_env_steps = ckpt.get("total_env_steps", 0) // max(1, self.world_size)
+        self.total_episodes = ckpt.get("total_episodes", 0) // max(1, self.world_size)
 
 
 class WMAgent:
