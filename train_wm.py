@@ -46,6 +46,11 @@ def main() -> None:
     ap.add_argument("--episodes-per-round", type=int, default=None)
     ap.add_argument("--prefill", type=int, default=None,
                     help="random prefill episodes per rank")
+    ap.add_argument("--eval-every", type=int, default=None,
+                    help="rounds between head-to-head evals vs the deployed model (0=off)")
+    ap.add_argument("--eval-games", type=int, default=None)
+    ap.add_argument("--eval-opponent", type=str, default=None,
+                    help="legacy PPO checkpoint to evaluate against")
     ap.add_argument("--seed", type=int, default=None)
     args = ap.parse_args()
 
@@ -98,6 +103,12 @@ def main() -> None:
         cfg.episodes_per_round = args.episodes_per_round
     if args.prefill is not None:
         cfg.prefill_episodes = args.prefill
+    if args.eval_every is not None:
+        cfg.eval_every = args.eval_every
+    if args.eval_games is not None:
+        cfg.eval_games = args.eval_games
+    if args.eval_opponent is not None:
+        cfg.eval_opponent = args.eval_opponent
     trainer = DreamerTrainer(cfg, device, rank=rank, world_size=world_size)
 
     ckpt = os.path.join(cfg.save_dir, "dreamer_latest.pt")

@@ -59,6 +59,10 @@ class DreamerConfig:
     wm_updates_per_round: int = 50
     ac_updates_per_round: int = 50
     max_grad_norm: float = 100.0
+    # evaluation vs the deployed legacy model (rank 0 only; 0 → disabled)
+    eval_every: int = 20              # rounds between head-to-head evals
+    eval_games: int = 200             # ±3.5%p standard error at 50%
+    eval_opponent: str = "checkpoints/best_model_control.pt"
     # io
     save_dir: str = "checkpoints_wm"
 
@@ -112,6 +116,8 @@ class DreamerTrainer:
         self._return_scale = 1.0
         self.total_env_steps = 0
         self.total_episodes = 0
+        self.best_win_rate = 0.0
+        self._legacy_opponent = None   # lazily loaded on first eval
         if self.is_main:
             os.makedirs(config.save_dir, exist_ok=True)
 
@@ -317,6 +323,34 @@ class DreamerTrainer:
         }
 
     # ------------------------------------------------------------------
+    # Evaluation vs deployed legacy model
+    # ------------------------------------------------------------------
+
+    def evaluate(self, n_games: Optional[int] = None, seed0: int = 0) -> Dict[str, float]:
+        """Head-to-head vs the deployed legacy checkpoint (win rate from the
+        world model's perspective, alternating seats, per-game seeds)."""
+        from src.wm.eval_arena import LegacyOpponentAdapter, evaluate_vs_legacy
+
+        if self._legacy_opponent is None:
+            if not os.path.exists(self.cfg.eval_opponent):
+                if self.is_main:
+                    print(f"[dreamer] eval opponent not found: {self.cfg.eval_opponent} "
+                          f"— skipping eval")
+                return {}
+            from src.agent import ModelAgent
+            inner = ModelAgent.from_checkpoint(self.cfg.eval_opponent, device=self.device)
+            self._legacy_opponent = LegacyOpponentAdapter(inner)
+
+        wm_agent = WMAgent(self.wm, self.actor, self.device)
+        stats = evaluate_vs_legacy(
+            wm_agent, self._legacy_opponent,
+            n_games=n_games or self.cfg.eval_games, seed0=seed0)
+        # WMAgent shares the live modules — restore train mode
+        self.wm.train()
+        self.actor.train()
+        return stats
+
+    # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
@@ -353,6 +387,22 @@ class DreamerTrainer:
             if self.is_main:
                 self.save(os.path.join(self.cfg.save_dir, "dreamer_latest.pt"))
 
+            # periodic head-to-head vs the deployed model (rank 0 only; other
+            # ranks proceed and simply wait at the next grad all-reduce)
+            if (self.is_main and self.cfg.eval_every > 0
+                    and r % self.cfg.eval_every == 0):
+                estats = self.evaluate(seed0=r * 10000)
+                if estats:
+                    print(f"[eval] vs {os.path.basename(self.cfg.eval_opponent)}: "
+                          f"win {estats['eval/win_rate']:.1%} "
+                          f"(P0 {estats['eval/win_rate_p0']:.1%} / "
+                          f"P1 {estats['eval/win_rate_p1']:.1%}, "
+                          f"{int(estats['eval/n_games'])} games)")
+                    if estats["eval/win_rate"] > self.best_win_rate:
+                        self.best_win_rate = estats["eval/win_rate"]
+                        self.save(os.path.join(self.cfg.save_dir, "dreamer_best.pt"))
+                        print(f"[eval] new best ({self.best_win_rate:.1%}) → dreamer_best.pt")
+
     # ------------------------------------------------------------------
     # Persistence / inference
     # ------------------------------------------------------------------
@@ -367,6 +417,7 @@ class DreamerTrainer:
             "ac_opt": self.ac_opt.state_dict(),
             "total_env_steps": self.world_size * self.total_env_steps,
             "total_episodes": self.world_size * self.total_episodes,
+            "best_win_rate": self.best_win_rate,
             "config": self.cfg.__dict__ | {"wm": self.cfg.wm.__dict__},
         }, path)
 
@@ -380,6 +431,7 @@ class DreamerTrainer:
         self.ac_opt.load_state_dict(ckpt["ac_opt"])
         self.total_env_steps = ckpt.get("total_env_steps", 0) // max(1, self.world_size)
         self.total_episodes = ckpt.get("total_episodes", 0) // max(1, self.world_size)
+        self.best_win_rate = ckpt.get("best_win_rate", 0.0)
 
 
 class WMAgent:
