@@ -388,9 +388,12 @@ class DreamerTrainer:
                       f"| eps {ws * self.total_episodes} "
                       f"| R {cstats['collect/mean_ep_reward']:.2f} "
                       f"| wm {wm_m.get('wm/loss', 0):.2f} "
-                      f"(obs {wm_m.get('wm/obs', 0):.2f}, kl {wm_m.get('wm/kl_dyn', 0):.2f}) "
+                      f"(obs {wm_m.get('wm/obs', 0):.2f}, "
+                      f"rew {wm_m.get('wm/reward', 0):.2f}, "
+                      f"kl {wm_m.get('wm/kl_dyn', 0):.2f}) "
                       f"| actor {ac_m.get('ac/actor_loss', 0):.4f} "
                       f"| critic {ac_m.get('ac/critic_loss', 0):.2f} "
+                      f"| ret {ac_m.get('ac/return_mean', 0):.2f}/S={ac_m.get('ac/return_scale', 0):.1f} "
                       f"| ent {ac_m.get('ac/entropy', 0):.2f}")
             if self.is_main:
                 self.save(os.path.join(self.cfg.save_dir, "dreamer_latest.pt"))
