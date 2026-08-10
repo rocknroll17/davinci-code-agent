@@ -76,3 +76,27 @@ def test_trainer_evaluate_uses_checkpoint(tmp_path):
                          save_dir="/tmp/wm_eval_test3")
     tr2 = DreamerTrainer(cfg2, torch.device("cpu"))
     assert tr2.evaluate(n_games=2) == {}
+
+
+def test_planner_agent_plays_legal_moves():
+    """Pure-MPC planner completes real games with only legal actions."""
+    torch.manual_seed(3)
+    from src.wm.nets import WorldModel
+    from src.wm.planner import WMPlannerAgent
+    wm = WorldModel(TINY)
+    agent = WMPlannerAgent(wm, torch.device("cpu"), horizon=3, n_samples=2)
+    env = DaVinciCodeEnv(seed=5, viewer=None, joker_control=True)
+    obs, _ = env.reset()
+    agent.reset()
+    for _ in range(200):
+        mask = env.get_action_mask()
+        phase = int(np.argmax(obs["phase"]))
+        action, _ = agent.act(obs, mask)
+        if phase == Phase.GUESS.value:
+            assert mask["position"][action[1]] and mask["value"][action[1]][action[2]]
+        elif phase == Phase.JOKER.value:
+            assert mask["joker"][action[4]]
+        obs, _, _, done, _, _, _ = env.step(action)
+        if done:
+            break
+    assert done
