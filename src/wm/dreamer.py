@@ -28,7 +28,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from src.model import obs_to_tensor, action_mask_to_tensor
-from src.vec_env import VectorDaVinciEnv
+from src.vec_env import SubprocVecEnv as VectorDaVinciEnv
 from src.wm.nets import Actor, Critic, WMConfig, WorldModel
 from src.wm.replay import EpisodeAccumulator, SequenceReplay
 
@@ -37,6 +37,7 @@ from src.wm.replay import EpisodeAccumulator, SequenceReplay
 class DreamerConfig:
     # environment / collection
     n_envs: int = 16
+    n_workers: Optional[int] = None
     seed: Optional[int] = None
     # replay
     replay_capacity: int = 5000       # episodes
@@ -48,6 +49,7 @@ class DreamerConfig:
     wm_lr: float = 1e-4
     # actor-critic (imagination)
     horizon: int = 15
+    imag_batch_size: Optional[int] = 1024
     gamma: float = 0.99               # episodes are ~45 steps (paper uses 0.997)
     lam: float = 0.95
     entropy_scale: float = 3e-4
@@ -105,7 +107,7 @@ class DreamerTrainer:
         rank_seed = None if config.seed is None else config.seed + rank * 100000
         self.replay = SequenceReplay(config.replay_capacity, config.seq_len, seed=rank_seed)
         self.vec_env = VectorDaVinciEnv(n_envs=config.n_envs, seed=rank_seed,
-                                        joker_control=True)
+                                        joker_control=True, n_workers=config.n_workers)
 
         # persistent collection state (per env): recurrent state + accumulators
         self._h = self._z = None
@@ -189,7 +191,10 @@ class DreamerTrainer:
                     done_episodes += 1
                     self.total_episodes += 1
                     # reset env + recurrent state for this slot
-                    reset_obs, _ = self.vec_env.reset_single(i)
+                    if infos[i] and "_reset_obs" in infos[i]:
+                        reset_obs = infos[i]["_reset_obs"]
+                    else:
+                        reset_obs, _ = self.vec_env.reset_single(i)
                     for k in next_obs:
                         next_obs[k][i] = reset_obs[k]
                     self._h[i] = 0.0
@@ -245,6 +250,9 @@ class DreamerTrainer:
             self.train_world_model()
         states, valid = self._last_states
         start = states.flatten(0, 1)[valid.flatten() > 0]          # (N, S)
+        if cfg.imag_batch_size is not None and start.shape[0] > cfg.imag_batch_size:
+            idx = torch.randperm(start.shape[0], device=states.device)[:cfg.imag_batch_size]
+            start = start[idx]
         if start.shape[0] == 0:
             # practically unreachable (every sampled episode has ≥2 real steps);
             # DDP-safe fallback: still run backward so grad all-reduce stays matched

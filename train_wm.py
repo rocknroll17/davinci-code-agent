@@ -44,6 +44,8 @@ def main() -> None:
     ap.add_argument("--updates", type=int, default=None,
                     help="WM and AC updates per collection round")
     ap.add_argument("--episodes-per-round", type=int, default=None)
+    ap.add_argument("--n-workers", type=int, default=None,
+                    help="parallel environment worker processes per rank")
     ap.add_argument("--prefill", type=int, default=None,
                     help="random prefill episodes per rank")
     ap.add_argument("--eval-every", type=int, default=None,
@@ -101,6 +103,8 @@ def main() -> None:
         cfg.ac_updates_per_round = args.updates
     if args.episodes_per_round is not None:
         cfg.episodes_per_round = args.episodes_per_round
+    if args.n_workers is not None:
+        cfg.n_workers = args.n_workers
     if args.prefill is not None:
         cfg.prefill_episodes = args.prefill
     if args.eval_every is not None:
