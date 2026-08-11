@@ -145,3 +145,60 @@ def test_full_dreamer_loop_tiny():
         obs, _, _, done, _, _, _ = env.step(action)
         if done:
             break
+
+
+TINY_TF = WMConfig(deter_dim=32, stoch_discrete=4, stoch_classes=4,
+                   hidden=32, embed_dim=32, n_bins=63,
+                   encoder="transformer", token_dim=16, enc_layers=1, enc_heads=2)
+
+
+def test_transformer_encoder_shapes_and_batch_time():
+    from src.wm.nets import TransformerObsEncoder
+    torch.manual_seed(0)
+    enc = TransformerObsEncoder(TINY_TF)
+    obs, *_ = _fake_batch(B=2, T=3)
+    out = enc(obs)                       # (B, T, ...) input
+    assert out.shape == (2, 3, TINY_TF.embed_dim)
+    flat_obs = {k: v[:, 0] for k, v in obs.items()}
+    out2 = enc(flat_obs)                 # (B, ...) input
+    assert out2.shape == (2, TINY_TF.embed_dim)
+    assert torch.allclose(out[:, 0], out2, atol=1e-5)
+
+
+def test_belief_supervision_and_transformer_loss():
+    torch.manual_seed(0)
+    wm = WorldModel(TINY_TF)
+    obs, actions, rewards, conts, is_first, masks, valid, flips = _fake_batch()
+    hidden = torch.randint(-1, 13, (3, 6, 13))
+    loss, states, metrics = wm.loss(obs, actions, rewards, conts, is_first,
+                                    mask_seq=masks, valid=valid, flip_seq=flips,
+                                    hidden_seq=hidden)
+    assert torch.isfinite(loss)
+    assert metrics["wm/belief"] > 0 and 0.0 <= metrics["wm/belief_acc"] <= 1.0
+    loss.backward()
+    # belief gradient reaches the encoder (deduction is forced into the latent)
+    from src.wm.nets import TransformerObsEncoder
+    assert any(p.grad is not None and p.grad.abs().sum() > 0
+               for p in wm.encoder.parameters())
+
+
+def test_full_loop_with_transformer_encoder():
+    torch.manual_seed(0)
+    cfg = DreamerConfig(
+        n_envs=2, seed=9, wm=TINY_TF, seq_len=16, batch_size=4,
+        prefill_episodes=0, episodes_per_round=2,
+        wm_updates_per_round=2, ac_updates_per_round=2, horizon=5,
+        save_dir="/tmp/wm_tf_test", eval_every=0,
+    )
+    tr = DreamerTrainer(cfg, torch.device("cpu"))
+    tr.collect(2, random_actor=True)
+    m = tr.train_world_model()
+    assert np.isfinite(m["wm/loss"]) and m["wm/belief_acc"] >= 0.0
+    ac = tr.train_actor_critic()
+    assert np.isfinite(ac["ac/actor_loss"])
+    # checkpoint roundtrip reconstructs the transformer encoder from config
+    path = "/tmp/wm_tf_test/ck.pt"
+    tr.save(path)
+    agent = WMAgent.from_checkpoint(path)
+    from src.wm.nets import TransformerObsEncoder
+    assert isinstance(agent.wm.encoder, TransformerObsEncoder)

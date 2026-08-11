@@ -38,9 +38,11 @@ class EpisodeAccumulator:
         self.rewards: List[float] = []
         self.continues: List[float] = []
         self.flips: List[float] = []
+        self.hidden_values: List[np.ndarray] = []   # true opp values, -1 = n/a
         self.terminal_obs: Optional[Dict[str, np.ndarray]] = None
 
-    def add(self, obs, action, reward, done, masks, flip: float = 0.0) -> None:
+    def add(self, obs, action, reward, done, masks, flip: float = 0.0,
+            hidden_values: Optional[np.ndarray] = None) -> None:
         for k in OBS_KEYS:
             self.obs[k].append(np.asarray(obs[k]))
         for k in MASK_KEYS:
@@ -49,6 +51,9 @@ class EpisodeAccumulator:
         self.rewards.append(float(reward))
         self.continues.append(0.0 if done else 1.0)
         self.flips.append(float(flip))
+        self.hidden_values.append(
+            np.full(13, -1, dtype=np.int8) if hidden_values is None
+            else np.asarray(hidden_values, dtype=np.int8))
 
     def set_terminal(self, obs) -> None:
         self.terminal_obs = {k: np.asarray(obs[k]) for k in OBS_KEYS}
@@ -63,6 +68,7 @@ class EpisodeAccumulator:
         rewards = list(self.rewards)
         continues = list(self.continues)
         flips = list(self.flips)
+        hidden = list(self.hidden_values)
         if self.terminal_obs is not None:
             for k in OBS_KEYS:
                 obs[k].append(self.terminal_obs[k])
@@ -72,6 +78,7 @@ class EpisodeAccumulator:
             rewards.append(0.0)
             continues.append(0.0)
             flips.append(0.0)
+            hidden.append(np.full(13, -1, dtype=np.int8))
         return {
             "obs": {k: np.stack(v) for k, v in obs.items()},
             "masks": {k: np.stack(v) for k, v in masks.items()},
@@ -79,6 +86,7 @@ class EpisodeAccumulator:
             "rewards": np.asarray(rewards, dtype=np.float32),
             "continues": np.asarray(continues, dtype=np.float32),
             "flips": np.asarray(flips, dtype=np.float32),
+            "hidden_values": np.stack(hidden),
         }
 
 
@@ -109,7 +117,7 @@ class SequenceReplay:
         L = self.seq_len
         obs_batch = {k: [] for k in OBS_KEYS}
         mask_batch = {k: [] for k in MASK_KEYS}
-        act_b, rew_b, cont_b, first_b, valid_b, flip_b = [], [], [], [], [], []
+        act_b, rew_b, cont_b, first_b, valid_b, flip_b, hid_b = [], [], [], [], [], [], []
 
         for _ in range(batch_size):
             ep = self.rng.choice(self.episodes)
@@ -133,6 +141,15 @@ class SequenceReplay:
             act_b.append(take(ep["actions"]))
             rew_b.append(take(ep["rewards"]))
             flip_b.append(take(ep.get("flips", np.zeros(T, dtype=np.float32))))
+            hid = ep.get("hidden_values")
+            if hid is None:
+                hid = np.full((T, 13), -1, dtype=np.int8)
+            seg = hid[start:end]
+            if pad:
+                # pad with -1 (no belief target), NOT zeros
+                seg = np.concatenate(
+                    [seg, np.full((pad, 13), -1, dtype=seg.dtype)])
+            hid_b.append(seg)
             cont = take(ep["continues"])
             if pad:
                 cont[n:] = 0.0
@@ -153,6 +170,7 @@ class SequenceReplay:
             "rewards": to(rew_b),
             "continues": to(cont_b),
             "flips": to(flip_b),
+            "hidden_values": to(hid_b, torch.int64),
             "is_first": to(first_b),
             "valid": to(valid_b),
         }

@@ -199,6 +199,7 @@ class DreamerTrainer:
                     action_np[i], rewards[i], bool(dones[i]),
                     {k: masks_np[k][i] for k in masks_np},
                     flip=flip,
+                    hidden_values=infos[i].get("hidden_values"),
                 )
                 if dones[i]:
                     ep = self._accs[i]
@@ -253,7 +254,7 @@ class DreamerTrainer:
         loss, states, metrics = self.wm.loss(
             batch["obs"], batch["actions"], batch["rewards"], batch["continues"],
             batch["is_first"], mask_seq=batch["masks"], valid=batch["valid"],
-            flip_seq=batch["flips"],
+            flip_seq=batch["flips"], hidden_seq=batch["hidden_values"],
         )
         self.wm_opt.zero_grad()
         loss.backward()
@@ -422,6 +423,7 @@ class DreamerTrainer:
                       f"| wm {wm_m.get('wm/loss', 0):.2f} "
                       f"(obs {wm_m.get('wm/obs', 0):.2f}, "
                       f"rew {wm_m.get('wm/reward', 0):.2f}, "
+                      f"bel {wm_m.get('wm/belief_acc', 0):.1%}, "
                       f"flip {wm_m.get('wm/flip', 0):.3f}, "
                       f"kl {wm_m.get('wm/kl_dyn', 0):.2f}) "
                       f"| actor {ac_m.get('ac/actor_loss', 0):.4f} "

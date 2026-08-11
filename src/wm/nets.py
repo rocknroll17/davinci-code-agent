@@ -111,7 +111,7 @@ def mlp(in_dim: int, hidden: int, out_dim: int, layers: int = 2) -> nn.Sequentia
 class WMConfig:
     deter_dim: int = 512          # GRU deterministic state h_t
     stoch_discrete: int = 16      # number of categorical distributions
-    stoch_classes: int = 16       # classes per distribution
+    stoch_classes: int = 16      # classes per distribution
     hidden: int = 512             # MLP width for heads/encoder
     embed_dim: int = 512          # observation embedding
     unimix: float = 0.01          # 1% uniform mixture on categorical probs
@@ -119,7 +119,15 @@ class WMConfig:
     beta_pred: float = 1.0
     beta_dyn: float = 0.5
     beta_rep: float = 0.1
+    beta_belief: float = 1.0      # auxiliary belief CE on the latent
     n_bins: int = 255             # two-hot bins
+    # observation encoder: "mlp" (flat 643-vector) or "transformer"
+    # (42-token self-attention with shared slot embeddings — the structure the
+    # deployed policy needed to learn constraint deduction)
+    encoder: str = "mlp"
+    token_dim: int = 128
+    enc_layers: int = 3
+    enc_heads: int = 4
 
     @property
     def stoch_dim(self) -> int:
@@ -168,6 +176,86 @@ class ObsEncoder(nn.Module):
             symlog(obs["remaining_deck"].float()),
         ]
         return self.net(torch.cat(parts, dim=-1))
+
+
+def _hand_indices(hand: torch.Tensor):
+    """(..., 13, 2) raw hand → (color_idx, value_idx) with the same remap as
+    _hand_onehot: color BLACK=0/WHITE=1/NONE→2; value 0-12, HIDDEN→13, NONE→14."""
+    colors = hand[..., 0].long().clamp(-1, 1)
+    colors = torch.where(colors < 0, torch.full_like(colors, 2), colors)
+    values = hand[..., 1].long().clamp(-2, 12)
+    values = torch.where(values == -2, torch.full_like(values, 14), values)
+    values = torch.where(values == -1, torch.full_like(values, 13), values)
+    return colors, values
+
+
+class TransformerObsEncoder(nn.Module):
+    """42-token self-attention encoder (CLS | my13 | opp13 | constraint13 |
+    phase | deck) → (…, embed_dim).
+
+    Carries the two structural elements the deployed policy needed to learn
+    constraint deduction (verified by its attention study):
+    - a SHARED slot embedding so my_i / opp_i / constraint_i have the same
+      positional identity — attention can bind a constraint row to its slot;
+    - full self-attention layers so slots eliminate candidates by referencing
+      each other over multiple hops.
+    Interface-compatible with ObsEncoder (dict in, embedding vector out).
+    """
+
+    def __init__(self, cfg: WMConfig) -> None:
+        super().__init__()
+        td = cfg.token_dim
+        self.color_embed = nn.Embedding(3, td)
+        self.value_embed = nn.Embedding(15, td)
+        self.slot_embed = nn.Embedding(MAX_HAND_SIZE, td)     # shared my/opp/con
+        self.segment_embed = nn.Embedding(5, td)              # my,opp,con,phase,deck
+        self.constraint_proj = nn.Linear(NUM_VALUES, td)
+        self.phase_proj = nn.Linear(4, td)
+        self.deck_proj = nn.Linear(2, td)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, td) * 0.02)
+        layer = nn.TransformerEncoderLayer(
+            d_model=td, nhead=cfg.enc_heads, dim_feedforward=td * 4,
+            dropout=0.0, batch_first=True, norm_first=True)
+        self.transformer = nn.TransformerEncoder(layer, num_layers=cfg.enc_layers)
+        self.out = nn.Linear(td, cfg.embed_dim)
+
+    def forward(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        my_hand = obs["my_hand"]
+        lead = my_hand.shape[:-2]                     # (B,) or (B, T)
+        N = int(torch.tensor(lead).prod()) if lead else 1
+
+        def flat(x, keep):                            # collapse leading dims
+            return x.reshape(N, *x.shape[len(lead):]) if lead else x.unsqueeze(0)
+
+        my = flat(my_hand, 2)
+        opp = flat(obs["opponent_hand"], 2)
+        cm = flat(obs["constraint_matrix"], 2).float()
+        phase = flat(obs["phase"], 1).float()
+        deck = flat(obs["remaining_deck"], 1).float()
+
+        device = my.device
+        slots = self.slot_embed(torch.arange(MAX_HAND_SIZE, device=device))    # (13, td)
+        seg = self.segment_embed(torch.arange(5, device=device))               # (5, td)
+
+        my_c, my_v = _hand_indices(my)
+        opp_c, opp_v = _hand_indices(opp)
+        my_tok = self.color_embed(my_c) + self.value_embed(my_v) + slots + seg[0]
+        opp_tok = self.color_embed(opp_c) + self.value_embed(opp_v) + slots + seg[1]
+        con_tok = self.constraint_proj(cm) + slots + seg[2]
+        phase_tok = (self.phase_proj(phase) + seg[3]).unsqueeze(1)
+        deck_tok = (self.deck_proj(symlog(deck)) + seg[4]).unsqueeze(1)
+        cls = self.cls_token.expand(N, -1, -1)
+
+        tokens = torch.cat([cls, my_tok, opp_tok, con_tok, phase_tok, deck_tok], dim=1)
+
+        my_pad = my_c == 2                             # empty slots
+        opp_pad = opp_c == 2
+        no_pad = torch.zeros(N, 1, dtype=torch.bool, device=device)
+        pad = torch.cat([no_pad, my_pad, opp_pad, opp_pad, no_pad, no_pad], dim=1)
+
+        out = self.transformer(tokens, src_key_padding_mask=pad)
+        embed = self.out(out[:, 0])
+        return embed.reshape(*lead, -1) if lead else embed.squeeze(0)
 
 
 class ObsDecoder(nn.Module):
@@ -459,12 +547,18 @@ class WorldModel(nn.Module):
     def __init__(self, cfg: WMConfig) -> None:
         super().__init__()
         self.cfg = cfg
-        self.encoder = ObsEncoder(cfg)
+        self.encoder = (TransformerObsEncoder(cfg) if cfg.encoder == "transformer"
+                        else ObsEncoder(cfg))
         self.rssm = RSSM(cfg)
         self.decoder = ObsDecoder(cfg)
         self.reward_head = mlp(cfg.state_dim, cfg.hidden, cfg.n_bins)
         self.continue_head = mlp(cfg.state_dim, cfg.hidden, 1)
         self.mask_head = MaskHead(cfg)
+        # Auxiliary belief supervision: predict the opponent's hidden card
+        # values from the latent. Forces deduction INTO (h, z) — without it the
+        # per-slot success probabilities stay too coarse for planning/policy
+        # (the belief-aware-MuZero / ReBeL ingredient for hidden-info games).
+        self.belief_head = mlp(cfg.state_dim, cfg.hidden, MAX_HAND_SIZE * NUM_VALUES)
         # Perspective-flip head: P(acting player changed between s_{t-1} and s_t).
         # Needed for zero-sum (negamax) returns inside imagination, where the
         # real env can't tell us whose turn it is.
@@ -524,6 +618,7 @@ class WorldModel(nn.Module):
         mask_seq: Optional[Dict[str, torch.Tensor]] = None,
         valid: Optional[torch.Tensor] = None,   # (B, T) 1.0 for real steps
         flip_seq: Optional[torch.Tensor] = None,  # (B, T) perspective-change flags
+        hidden_seq: Optional[torch.Tensor] = None,  # (B, T, 13) true opp values, -1 = n/a
     ):
         post, prior, states = self.observe(obs_seq, action_seq, is_first)
         B, T = action_seq.shape[:2]
@@ -560,6 +655,20 @@ class WorldModel(nn.Module):
             flip_m = wmean(l_flip, valid)
             pred_m = pred_m + flip_m
 
+        belief_m = torch.tensor(0.0, device=states.device)
+        belief_acc = torch.tensor(0.0, device=states.device)
+        if hidden_seq is not None:
+            bl = self.belief_head(states).view(B, T, MAX_HAND_SIZE, NUM_VALUES)
+            tgt = hidden_seq.long()                              # -1 = not hidden
+            bmask = (tgt >= 0).float() * valid.unsqueeze(-1)     # (B, T, 13)
+            if bmask.sum() > 0:
+                ce = F.cross_entropy(
+                    bl.flatten(0, 2), tgt.clamp(min=0).flatten(),
+                    reduction="none").view(B, T, MAX_HAND_SIZE)
+                belief_m = (ce * bmask).sum() / bmask.sum()
+                belief_acc = ((bl.argmax(-1) == tgt).float() * bmask).sum() / bmask.sum()
+                pred_m = pred_m + self.cfg.beta_belief * belief_m
+
         l_dyn, l_rep = self.rssm.kl_losses(post, prior)
         dyn_m = wmean(l_dyn, valid)
         rep_m = wmean(l_rep, valid)
@@ -573,6 +682,8 @@ class WorldModel(nn.Module):
             "wm/reward": float(rew_m.detach()),
             "wm/continue": float(cont_m.detach()),
             "wm/flip": float(flip_m.detach()),
+            "wm/belief": float(belief_m.detach()),
+            "wm/belief_acc": float(belief_acc.detach()),
             "wm/kl_dyn": float(dyn_m.detach()),
             "wm/kl_rep": float(rep_m.detach()),
         }

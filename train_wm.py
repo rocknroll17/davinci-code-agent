@@ -50,6 +50,9 @@ def main() -> None:
                     help="actor entropy bonus (default 3e-4; raise to fight collapse)")
     ap.add_argument("--ac-lr", type=float, default=None,
                     help="actor-critic learning rate (default 3e-5)")
+    ap.add_argument("--encoder", choices=["mlp", "transformer"], default=None,
+                    help="observation encoder (transformer = 42-token self-attention "
+                         "with shared slot embeddings, for constraint deduction)")
     ap.add_argument("--prefill", type=int, default=None,
                     help="random prefill episodes per rank")
     ap.add_argument("--eval-every", type=int, default=None,
@@ -87,7 +90,9 @@ def main() -> None:
     elif args.large:
         # DreamerV3 paper latents (32x32) + wider nets — ~24GB GPU territory
         wm_cfg = WMConfig(deter_dim=1024, stoch_discrete=32, stoch_classes=32,
-                          hidden=1024, embed_dim=1024)
+                          hidden=1024, embed_dim=1024, enc_layers=4)
+    if args.encoder is not None:
+        wm_cfg.encoder = args.encoder
 
     cfg = DreamerConfig(n_envs=args.envs, seed=args.seed, wm=wm_cfg)
     if args.large:
