@@ -9,10 +9,12 @@ Dreamer-style training loop for Da Vinci Code:
 The actor-critic never sees a real transition during its update — it learns
 entirely from rollouts imagined by the RSSM (DreamerV3, arXiv:2301.04104).
 
-Self-play convention: identical to the PPO trainer — one policy, one
-alternating-perspective stream per env. Rewards are credited to the acting
-player and the stream is treated as a single-agent trajectory (the world model
-learns the perspective flip as part of the dynamics).
+Self-play convention: PER-PLAYER streams. Each game yields two replay episodes,
+one per player, containing only that player's own turns — the opponent's moves
+are absorbed into the transition dynamics. This matches deployment exactly: at
+serving time the agent can only observe its own decision points. (A previous
+single-stream convention let the recurrent state carry the opponent's private
+observations between turns — skill learned on that leak collapses at serving.)
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from src.constants import REWARD_LOSE, REWARD_WIN
 from src.model import obs_to_tensor, action_mask_to_tensor
 from src.vec_env import SubprocVecEnv as VectorDaVinciEnv
 from src.wm.nets import Actor, Critic, WMConfig, WorldModel
@@ -109,12 +112,13 @@ class DreamerTrainer:
         self.vec_env = VectorDaVinciEnv(n_envs=config.n_envs, seed=rank_seed,
                                         joker_control=True, n_workers=config.n_workers)
 
-        # persistent collection state (per env): recurrent state + accumulators
+        # persistent collection state (per env, PER PLAYER): recurrent state +
+        # episode streams — initialized lazily in _reset_collection_state
         self._h = self._z = None
         self._prev_action = None
-        self._accs = [EpisodeAccumulator() for _ in range(config.n_envs)]
+        self._accs = None
         self._obs = None
-        self._last_player = [None] * config.n_envs   # for perspective-flip flags
+        self._cur = None
 
         self._return_scale = 1.0
         self.total_env_steps = 0
@@ -143,30 +147,42 @@ class DreamerTrainer:
 
     def _reset_collection_state(self) -> None:
         n = self.cfg.n_envs
-        self._h, self._z = self.wm.rssm.initial(n, self.device)
-        self._prev_action = torch.zeros(n, 5, dtype=torch.long, device=self.device)
-        self._obs, _ = self.vec_env.reset()
-        self._accs = [EpisodeAccumulator() for _ in range(n)]
-        self._last_player = [None] * n
+        # PER-PLAYER recurrent state and episode streams: row 2*i + p belongs to
+        # player p of env i. Each player's memory sees ONLY their own turns —
+        # exactly what is available at serving time. (The previous single-stream
+        # convention let the recurrent state carry the opponent's private
+        # observations across turns: an information leak that trained skill
+        # unusable in deployment — 68.6% vs 16.0% guess accuracy.)
+        self._h, self._z = self.wm.rssm.initial(2 * n, self.device)
+        self._prev_action = torch.zeros(2 * n, 5, dtype=torch.long, device=self.device)
+        self._obs, infos = self.vec_env.reset()
+        self._accs = [[EpisodeAccumulator(), EpisodeAccumulator()] for _ in range(n)]
+        self._cur = np.array([int(inf.get("current_player", 0)) for inf in infos])
 
     @torch.no_grad()
     def collect(self, n_episodes: int, random_actor: bool = False) -> Dict[str, float]:
-        """Run the actor in the real vectorized env until n_episodes finish."""
+        """Run the actor in the real vectorized env until n_episodes (games) finish.
+
+        Every game contributes TWO replay episodes — one per player stream."""
         if self._obs is None:
             self._reset_collection_state()
 
         done_episodes = 0
         ep_rewards = []
         guess_hits = guess_total = 0
+        n = self.cfg.n_envs
+        arange = np.arange(n)
         while done_episodes < n_episodes:
             obs_t = {k: torch.as_tensor(v).to(self.device) for k, v in self._obs.items()}
             masks_np = self.vec_env.get_action_masks()
 
-            # posterior state from real observation
+            # rows of the CURRENTLY ACTING player in each env
+            rows = torch.as_tensor(2 * arange + self._cur, device=self.device)
             embed = self.wm.encoder(obs_t)
-            self._h = self.wm.rssm.step_deter(self._h, self._z, self._prev_action)
-            _, self._z = self.wm.rssm.posterior(self._h, embed)
-            state = torch.cat([self._h, self._z], dim=-1)
+            h_new = self.wm.rssm.step_deter(self._h[rows], self._z[rows],
+                                            self._prev_action[rows])
+            _, z_new = self.wm.rssm.posterior(h_new, embed)
+            state = torch.cat([h_new, z_new], dim=-1)
 
             phase_idx = obs_t["phase"].float().argmax(-1)
             if random_actor:
@@ -174,56 +190,71 @@ class DreamerTrainer:
             else:
                 masks_t = {k: torch.as_tensor(v).to(self.device) for k, v in masks_np.items()}
                 action, _, _ = self.actor.sample(state, masks_t, phase_idx)
+            self._h[rows] = h_new
+            self._z[rows] = z_new
+            self._prev_action[rows] = action
             action_np = action.cpu().numpy()
 
             next_obs, rewards, terminated, truncated, infos, results = self.vec_env.step(action_np)
             dones = terminated | truncated
-            self.total_env_steps += self.cfg.n_envs
+            self.total_env_steps += n
 
             phase_np = self._obs["phase"].argmax(-1)
-            for i in range(self.cfg.n_envs):
-                # actor skill proxy: accuracy of GUESS-phase actions (visible
-                # long before the win rate moves off 0%)
+            for i in range(n):
                 if phase_np[i] == 1:
                     guess_total += 1
                     if rewards[i] > 0:
                         guess_hits += 1
-                # perspective flip = the acting player changed vs the previous step
-                pid = int(results[i].player_id) if (
-                    results[i] is not None and hasattr(results[i], "player_id")) else 0
-                flip = 0.0 if self._last_player[i] is None else float(pid != self._last_player[i])
-                self._last_player[i] = pid
+                pid = int(self._cur[i])
 
-                self._accs[i].add(
+                self._accs[i][pid].add(
                     {k: self._obs[k][i] for k in self._obs},
                     action_np[i], rewards[i], bool(dones[i]),
                     {k: masks_np[k][i] for k in masks_np},
-                    flip=flip,
+                    flip=0.0,   # own-turn streams never change perspective
                     hidden_values=infos[i].get("hidden_values"),
                 )
                 if dones[i]:
-                    ep = self._accs[i]
-                    # terminal observation BEFORE the reset obs overwrites it —
-                    # the reward head learns the win/lose reward from this frame
-                    ep.set_terminal({k: np.array(next_obs[k][i], copy=True) for k in next_obs})
-                    ep_rewards.append(float(sum(ep.rewards)))
-                    self.replay.add_episode(ep.pack())
-                    self._accs[i] = EpisodeAccumulator()
-                    self._last_player[i] = None
+                    winner = infos[i].get("_winner", infos[i].get("winner"))
+                    actor_ep = self._accs[i][pid]
+                    other_ep = self._accs[i][1 - pid]
+                    # acting player's stream: true terminal observation
+                    actor_ep.set_terminal({k: np.array(next_obs[k][i], copy=True)
+                                           for k in next_obs})
+                    if winner is not None and winner != pid and actor_ep.rewards:
+                        # acting player lost on their own move (self-reveal)
+                        actor_ep.rewards[-1] += float(REWARD_LOSE)
+                    # other player's stream ends between their turns: close it on
+                    # their last own step with the symmetric terminal reward.
+                    # Terminal frame reuses their last own-turn observation
+                    # (their true post-game perspective is not observable here —
+                    # one slightly stale decoder target per episode).
+                    if other_ep.rewards:
+                        other_ep.rewards[-1] += float(
+                            REWARD_WIN if winner == 1 - pid else REWARD_LOSE)
+                        other_ep.continues[-1] = 0.0
+                        other_ep.set_terminal({k: other_ep.obs[k][-1] for k in other_ep.obs})
+                    for ep in (actor_ep, other_ep):
+                        if ep.rewards:
+                            ep_rewards.append(float(sum(ep.rewards)))
+                            self.replay.add_episode(ep.pack())
+                    self._accs[i] = [EpisodeAccumulator(), EpisodeAccumulator()]
                     done_episodes += 1
                     self.total_episodes += 1
-                    # reset env + recurrent state for this slot
+                    # reset env + BOTH players' recurrent state for this slot
                     if infos[i] and "_reset_obs" in infos[i]:
                         reset_obs = infos[i]["_reset_obs"]
                     else:
                         reset_obs, _ = self.vec_env.reset_single(i)
                     for k in next_obs:
                         next_obs[k][i] = reset_obs[k]
-                    self._h[i] = 0.0
-                    self._z[i] = 0.0
-                    action_np[i] = 0
+                    self._h[2 * i:2 * i + 2] = 0.0
+                    self._z[2 * i:2 * i + 2] = 0.0
+                    self._prev_action[2 * i:2 * i + 2] = 0
+                    self._cur[i] = 0
+                else:
+                    self._cur[i] = int(infos[i].get("current_player", self._cur[i]))
 
-            self._prev_action = torch.as_tensor(action_np, device=self.device)
             self._obs = next_obs
 
         return {"collect/mean_ep_reward": float(np.mean(ep_rewards)) if ep_rewards else 0.0,

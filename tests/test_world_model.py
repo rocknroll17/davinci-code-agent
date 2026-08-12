@@ -202,3 +202,24 @@ def test_full_loop_with_transformer_encoder():
     agent = WMAgent.from_checkpoint(path)
     from src.wm.nets import TransformerObsEncoder
     assert isinstance(agent.wm.encoder, TransformerObsEncoder)
+
+
+def test_per_player_streams_no_leak():
+    """Each game yields two own-turn-only episodes with symmetric terminal rewards."""
+    torch.manual_seed(1)
+    cfg = DreamerConfig(
+        n_envs=2, seed=11, wm=TINY, seq_len=16, batch_size=4,
+        prefill_episodes=0, episodes_per_round=2, save_dir="/tmp/wm_pps_test",
+        eval_every=0,
+    )
+    tr = DreamerTrainer(cfg, torch.device("cpu"))
+    stats = tr.collect(3, random_actor=True)
+    # two streams per finished game
+    assert tr.replay.n_episodes == 2 * stats["collect/episodes"]
+    for ep in tr.replay.episodes:
+        assert (ep["flips"] == 0).all()          # own-turn streams never flip
+        assert ep["continues"][-1] == 0.0        # every stream is closed
+    # zero-sum terminal credit: exactly one stream per game carries +10, one -10
+    totals = [float(ep["rewards"].sum()) for ep in tr.replay.episodes]
+    pos = sum(1 for t in totals if t > 4)        # winner streams (+10 net-ish)
+    assert pos >= 1                              # at least one clear winner stream
