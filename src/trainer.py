@@ -494,14 +494,15 @@ class PPOTrainer:
         return mean
 
     def _loss(self, batch: Dict[str, Any], entropy_weight: Dict[str, float]) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Total PPO loss for one minibatch, plus its parts for logging."""
-        # Heavy forward in fp16 (if enabled), then the cheap loss math in fp32.
+        """Total PPO loss for one minibatch (B rows), plus its parts for logging."""
+        # The network forward runs in fp16 (if enabled); the loss math below runs in fp32.
         with torch.autocast("cuda", dtype=torch.float16, enabled=self._fp16):
             log_probs, values, entropies, belief_logits = self.policy.evaluate_actions(
                 batch["obs"], batch["actions"], batch["action_mask"])
-        values, belief_logits = values.float().squeeze(-1), belief_logits.float()
-        log_probs = {k: v.float() for k, v in log_probs.items()}
-        entropies = {k: v.float() for k, v in entropies.items()}
+        values = values.float().squeeze(-1)          # (B,)
+        belief_logits = belief_logits.float()        # (B, 13, 13)
+        log_probs = {k: v.float() for k, v in log_probs.items()}   # {head: (B,)}
+        entropies = {k: v.float() for k, v in entropies.items()}   # {head: (B,)}
 
         pi_loss, entropy, kls, clipfracs = ppo_loss.policy_loss(
             log_probs, batch["old_log_probs"], entropies, batch["advantages"],

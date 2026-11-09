@@ -1,16 +1,22 @@
 """
 Policy network for Da Vinci Code.
 
-    observation ─► ObservationEncoder ─► features (global state, CLS token)
-                                      └► opp_per_pos (one vector per opponent slot)
-    opp_per_pos ─► belief head (predicts each hidden opponent value) ─► added back
-    features + opp_per_pos ─► action heads (color / position / value / decision)
-    features ─► ValueHead ─► V(s)
+Data flow (B = batch size, 13 = hand slots, 13 = card values 0-12):
 
-One step of the game is one of three phases, and only that phase's head acts:
-    DRAW     → color      (which color to draw)
-    GUESS    → position, then value given that position
-    DECISION → decision   (stop / keep guessing)
+    observation
+      └─► ObservationEncoder (Transformer over 42 tokens)
+            ├─► features          (B, 512)      summary of the whole game state
+            └─► opponent_slots    (B, 13, 64)   one vector per opponent card slot
+    opponent_slots ─► belief head ─► "what value is each hidden opponent card?"  (B, 13, 13)
+                   └─ the belief is added back onto opponent_slots
+    features + opponent_slots ─► action heads ─► logits for color / position / value / decision
+    features ─► ValueHead ─► V(s)  (B, 1)
+
+A game step is in exactly one phase, and only that phase's heads choose an action:
+    DRAW     → color      which color to draw
+    GUESS    → position   which opponent card to guess, then
+               value      which number it is (conditioned on the chosen position)
+    DECISION → decision   stop, or keep guessing
 """
 
 from typing import Dict, Optional, Tuple
@@ -23,8 +29,11 @@ from torch.distributions import Categorical
 
 from src.constants import MASK_VALUE, MAX_HAND_SIZE, NUM_VALUES
 
-# Token segments (which group a token belongs to)
+# Token groups, used as segment-embedding ids
 SEG_MY, SEG_OPP, SEG_PHASE, SEG_DECK, SEG_CONSTRAINT = 0, 1, 2, 3, 4
+
+# Columns of the phase one-hot
+DRAW, GUESS, DECISION = 0, 1, 2
 
 ACTION_KEYS = ["color", "position", "value", "decision"]
 
@@ -33,30 +42,44 @@ ACTION_KEYS = ["color", "position", "value", "decision"]
 # Masking helpers
 # ---------------------------------------------------------------------------
 
-def apply_mask(logits: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
-    """Push illegal actions to MASK_VALUE (finite, so fp16 stays NaN-free)."""
-    if mask is None:
-        return logits
-    return logits.masked_fill(~mask.to(logits.device), MASK_VALUE)
+def mask_illegal(logits: torch.Tensor, legal: Optional[torch.Tensor]) -> torch.Tensor:
+    """Set the logits of illegal actions to MASK_VALUE.
 
-
-def gate(logits: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
-    """Mask every action of rows whose phase does not use this head. active: (B,)."""
-    active = active.bool().unsqueeze(-1).expand_as(logits)
-    return torch.where(active, logits, torch.full_like(logits, MASK_VALUE))
-
-
-def masked_categorical(logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Categorical]:
-    """Distribution over the rows that have at least one legal action.
-
-    Returns (valid_rows, safe_logits, dist); dist covers only logits[valid_rows].
-    A tiny 1e-6 floor keeps log_prob finite.
+    logits: (B, A), legal: (B, A) bool or None (= everything legal).
+    MASK_VALUE is a large negative *finite* number, not -inf: under fp16,
+    softmax over a row of -inf gives NaN.
     """
-    valid = ~torch.all(logits <= MASK_VALUE + 1, dim=-1)
-    safe_logits = torch.clamp(logits[valid], min=MASK_VALUE)
-    probs = F.softmax(safe_logits, dim=-1) + 1e-6
+    if legal is None:
+        return logits
+    legal = legal.to(logits.device)
+    return logits.masked_fill(~legal, MASK_VALUE)
+
+
+def mask_inactive_phase(logits: torch.Tensor, phase_is_active: torch.Tensor) -> torch.Tensor:
+    """Mask every action in rows where this head's phase is not the current phase.
+
+    logits: (B, A), phase_is_active: (B,) — e.g. phase[:, GUESS] for the position head.
+    """
+    active = phase_is_active.bool().unsqueeze(-1).expand_as(logits)  # (B, A)
+    masked = torch.full_like(logits, MASK_VALUE)
+    return torch.where(active, logits, masked)
+
+
+def legal_action_distribution(logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Categorical]:
+    """Categorical distribution over the rows that have at least one legal action.
+
+    logits: (B, A) already masked.
+    Returns:
+        has_legal:   (B,) bool — rows where some action is legal
+        safe_logits: (N, A)    — logits of those rows (N = has_legal.sum())
+        dist:        Categorical over those N rows
+    A 1e-6 floor on every probability keeps log_prob finite even for masked actions.
+    """
+    has_legal = ~torch.all(logits <= MASK_VALUE + 1, dim=-1)       # (B,)
+    safe_logits = torch.clamp(logits[has_legal], min=MASK_VALUE)   # (N, A)
+    probs = F.softmax(safe_logits, dim=-1) + 1e-6                  # (N, A)
     probs = probs / probs.sum(dim=-1, keepdim=True)
-    return valid, safe_logits, Categorical(probs)
+    return has_legal, safe_logits, Categorical(probs)
 
 
 # ---------------------------------------------------------------------------
@@ -64,12 +87,17 @@ def masked_categorical(logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor
 # ---------------------------------------------------------------------------
 
 class ObservationEncoder(nn.Module):
-    """Turn the observation into 42 tokens and run a Transformer over them.
+    """Turn an observation into 42 tokens and run a Transformer over them.
 
-    Tokens: [CLS | my cards (13) | opponent cards (13) | constraints (13) | phase | deck]
-    - constraint token i = the values I ruled out for opponent slot i
-    - my card token i also carries the values the opponent ruled out for it
-    All slot-i tokens share one slot embedding so attention can line them up.
+    Token layout (index: content):
+        0       CLS — its output becomes `features`
+        1-13    my cards            (+ what the opponent ruled out for each of them)
+        14-26   opponent cards      (hidden values show up as "hidden")
+        27-39   constraints         (what I ruled out for each opponent card)
+        40      phase
+        41      deck                (cards left per color)
+    Slot i of my cards, opponent cards and constraints share one slot embedding,
+    so attention can tell that "constraint i" belongs to "opponent card i".
     """
 
     def __init__(self, hidden_dim: int = 512, token_dim: int = 128,
@@ -78,8 +106,9 @@ class ObservationEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.token_dim = token_dim
 
-        # (Layer creation order is kept as-is: it fixes the random init for a given seed.)
-        # Card = color (BLACK/WHITE/none) + value (0-12/hidden/none) + position
+        # NOTE: keep the layer creation order — it fixes the random init for a given seed.
+
+        # A card = color (BLACK / WHITE / no card) + value (0-12 / hidden / no card) + slot
         self.color_embed = nn.Embedding(3, 16)
         self.value_embed = nn.Embedding(15, 32)
         self.position_embed = nn.Embedding(MAX_HAND_SIZE, 16)
@@ -96,61 +125,87 @@ class ObservationEncoder(nn.Module):
                                            batch_first=True, norm_first=True)
         self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
 
+        # One 13-value row per slot → one token
         self.constraint_proj = nn.Sequential(nn.Linear(NUM_VALUES, token_dim),
                                              nn.LayerNorm(token_dim), nn.ReLU())
-        # Zero-initialized in DaVinciCodePolicy so loaded checkpoints start unchanged.
+        # Zero-initialized in DaVinciCodePolicy, so loading an older checkpoint changes nothing.
         self.my_hand_constraint_proj = nn.Linear(NUM_VALUES, token_dim)
 
         self.opp_per_pos_proj = nn.Linear(token_dim, 64)
         self.fusion = nn.Sequential(nn.Linear(token_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.ReLU(),
                                     nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.ReLU())
 
-    def _tokenize_hand(self, hand: torch.Tensor) -> torch.Tensor:
-        """hand (B, 13, 2) = [color, value] per slot → card tokens (B, 13, token_dim)."""
-        colors = hand[:, :, 0].long().clamp(-1, 1)
-        colors = torch.where(colors < 0, torch.full_like(colors, 2), colors)  # none → 2
-        values = hand[:, :, 1].long().clamp(-2, 12)
-        values = torch.where(values == -2, torch.full_like(values, 14), values)  # none → 14
-        values = torch.where(values == -1, torch.full_like(values, 13), values)  # hidden → 13
-
-        positions = torch.arange(MAX_HAND_SIZE, device=hand.device).expand(hand.size(0), -1)
-        pos_scalar = (positions.float() / (MAX_HAND_SIZE - 1)).unsqueeze(-1)  # left < right
-        token = torch.cat([self.color_embed(colors), self.value_embed(values),
-                           self.position_embed(positions), pos_scalar], dim=-1)
-        return self.card_proj(token)
-
-    def _segment(self, batch_size: int, n: int, segment: int, device) -> torch.Tensor:
-        return self.segment_embed(torch.full((batch_size, n), segment, dtype=torch.long, device=device))
-
     def forward(self, obs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (features (B, hidden_dim), constraint_per_pos (B, 13, token_dim),
-        opponent_per_pos (B, 13, 64))."""
-        my_hand = obs["my_hand"].float()
-        opponent_hand = obs["opponent_hand"].float()
-        B, device = my_hand.size(0), my_hand.device
+        """
+        Returns:
+            features:           (B, hidden_dim)  from the CLS token
+            constraint_per_pos: (B, 13, token_dim) constraint tokens before attention
+            opponent_per_pos:   (B, 13, 64)      opponent card tokens after attention
+        """
+        my_hand = obs["my_hand"].float()               # (B, 13, 2) [color, value]
+        opponent_hand = obs["opponent_hand"].float()   # (B, 13, 2), value -1 = hidden
+        batch_size = my_hand.size(0)
+        device = my_hand.device
 
-        slot_pe = self.slot_pos_embed(torch.arange(MAX_HAND_SIZE, device=device).expand(B, -1))
-        constraint_per_pos = self.constraint_proj(obs["opp_hand_constraint"].float())
+        slots = torch.arange(MAX_HAND_SIZE, device=device).expand(batch_size, -1)  # (B, 13)
+        slot_pe = self.slot_pos_embed(slots)                                        # (B, 13, D)
 
-        my_tokens = self._tokenize_hand(my_hand) + self._segment(B, MAX_HAND_SIZE, SEG_MY, device) + slot_pe
-        my_tokens = my_tokens + self.my_hand_constraint_proj(obs["my_hand_constraint"].float())
-        opp_tokens = self._tokenize_hand(opponent_hand) + self._segment(B, MAX_HAND_SIZE, SEG_OPP, device) + slot_pe
-        con_tokens = constraint_per_pos + self._segment(B, MAX_HAND_SIZE, SEG_CONSTRAINT, device) + slot_pe
-        phase_token = self.phase_proj(obs["phase"].float()).unsqueeze(1) + self._segment(B, 1, SEG_PHASE, device)
-        deck_token = self.deck_proj(obs["remaining_deck"].float()).unsqueeze(1) + self._segment(B, 1, SEG_DECK, device)
-        cls = self.cls_token.expand(B, -1, -1)
-        tokens = torch.cat([cls, my_tokens, opp_tokens, con_tokens, phase_token, deck_token], dim=1)
+        # My cards, plus what the opponent has ruled out for each of them
+        my_tokens = self._tokenize_hand(my_hand)                                    # (B, 13, D)
+        my_tokens = my_tokens + self._segment(batch_size, MAX_HAND_SIZE, SEG_MY, device) + slot_pe
+        my_ruled_out = self.my_hand_constraint_proj(obs["my_hand_constraint"].float())  # (B, 13, D)
+        my_tokens = my_tokens + my_ruled_out
 
-        # Empty card slots (color < 0) are ignored by attention; constraints share the opponent's padding.
-        my_pad, opp_pad = my_hand[:, :, 0] < 0, opponent_hand[:, :, 0] < 0
-        never = torch.zeros(B, 1, dtype=torch.bool, device=device)
-        padding = torch.cat([never, my_pad, opp_pad, opp_pad, never, never], dim=1)
+        opp_tokens = self._tokenize_hand(opponent_hand)                             # (B, 13, D)
+        opp_tokens = opp_tokens + self._segment(batch_size, MAX_HAND_SIZE, SEG_OPP, device) + slot_pe
 
-        tokens = self.transformer(tokens, src_key_padding_mask=padding)
+        # What I have ruled out for each opponent card
+        constraint_per_pos = self.constraint_proj(obs["opp_hand_constraint"].float())  # (B, 13, D)
+        con_tokens = constraint_per_pos + self._segment(batch_size, MAX_HAND_SIZE, SEG_CONSTRAINT, device) + slot_pe
 
-        features = self.fusion(tokens[:, 0])
-        opponent_per_pos = self.opp_per_pos_proj(tokens[:, 1 + MAX_HAND_SIZE:1 + 2 * MAX_HAND_SIZE])
+        phase_token = self.phase_proj(obs["phase"].float()).unsqueeze(1)           # (B, 1, D)
+        phase_token = phase_token + self._segment(batch_size, 1, SEG_PHASE, device)
+        deck_token = self.deck_proj(obs["remaining_deck"].float()).unsqueeze(1)     # (B, 1, D)
+        deck_token = deck_token + self._segment(batch_size, 1, SEG_DECK, device)
+
+        cls = self.cls_token.expand(batch_size, -1, -1)                             # (B, 1, D)
+        tokens = torch.cat([cls, my_tokens, opp_tokens, con_tokens, phase_token, deck_token], dim=1)  # (B, 42, D)
+
+        # Attention ignores empty card slots (color < 0); a constraint token is empty
+        # exactly when its opponent slot is.
+        my_empty = my_hand[:, :, 0] < 0                                             # (B, 13)
+        opp_empty = opponent_hand[:, :, 0] < 0                                      # (B, 13)
+        never = torch.zeros(batch_size, 1, dtype=torch.bool, device=device)        # (B, 1)
+        padding = torch.cat([never, my_empty, opp_empty, opp_empty, never, never], dim=1)  # (B, 42)
+
+        tokens = self.transformer(tokens, src_key_padding_mask=padding)             # (B, 42, D)
+
+        features = self.fusion(tokens[:, 0])                                        # (B, hidden_dim)
+        opp_out = tokens[:, 1 + MAX_HAND_SIZE:1 + 2 * MAX_HAND_SIZE]                # (B, 13, D)
+        opponent_per_pos = self.opp_per_pos_proj(opp_out)                           # (B, 13, 64)
         return features, constraint_per_pos, opponent_per_pos
+
+    def _tokenize_hand(self, hand: torch.Tensor) -> torch.Tensor:
+        """hand (B, 13, 2) [color, value] → card tokens (B, 13, D)."""
+        colors = hand[:, :, 0].long().clamp(-1, 1)                                  # (B, 13)
+        colors = torch.where(colors < 0, torch.full_like(colors, 2), colors)        # no card → 2
+        values = hand[:, :, 1].long().clamp(-2, 12)                                 # (B, 13)
+        values = torch.where(values == -2, torch.full_like(values, 14), values)     # no card → 14
+        values = torch.where(values == -1, torch.full_like(values, 13), values)     # hidden → 13
+
+        positions = torch.arange(MAX_HAND_SIZE, device=hand.device).expand(hand.size(0), -1)  # (B, 13)
+        position_scalar = (positions.float() / (MAX_HAND_SIZE - 1)).unsqueeze(-1)   # (B, 13, 1), keeps left < right
+
+        card = torch.cat([self.color_embed(colors),          # (B, 13, 16)
+                          self.value_embed(values),          # (B, 13, 32)
+                          self.position_embed(positions),    # (B, 13, 16)
+                          position_scalar], dim=-1)          # (B, 13, 65)
+        return self.card_proj(card)
+
+    def _segment(self, batch_size: int, n_tokens: int, segment: int, device) -> torch.Tensor:
+        """Segment embedding for n_tokens tokens of one group → (B, n_tokens, D)."""
+        ids = torch.full((batch_size, n_tokens), segment, dtype=torch.long, device=device)
+        return self.segment_embed(ids)
 
 
 # ---------------------------------------------------------------------------
@@ -158,10 +213,7 @@ class ObservationEncoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 class PhaseGatedActionHead(nn.Module):
-    """color / position / value / decision logits.
-
-    The value head is conditioned on the chosen position (autoregressive GUESS).
-    """
+    """Logits for the four action parts. Value is conditioned on the chosen position."""
 
     def __init__(self, hidden_dim: int = 512) -> None:
         super().__init__()
@@ -173,45 +225,60 @@ class PhaseGatedActionHead(nn.Module):
                                         nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, NUM_VALUES))
         self.decision_head = nn.Sequential(nn.Linear(hidden_dim, 64), nn.ReLU(), nn.Linear(64, 2))
 
-    def first_stage_logits(self, features: torch.Tensor, opponent_per_pos: torch.Tensor,
-                           phase: torch.Tensor, action_mask: Optional[Dict[str, torch.Tensor]]
-                           ) -> Dict[str, torch.Tensor]:
-        """Masked + phase-gated logits of every head except value."""
-        mask = action_mask or {}
-        slots = features.unsqueeze(1).expand(-1, MAX_HAND_SIZE, -1)
-        position = self.position_head(torch.cat([slots, opponent_per_pos], dim=-1)).squeeze(-1)
+    def logits_without_value(self, features: torch.Tensor, opponent_per_pos: torch.Tensor,
+                             phase: torch.Tensor, legal: Optional[Dict[str, torch.Tensor]]
+                             ) -> Dict[str, torch.Tensor]:
+        """Masked logits of color (B, 2), position (B, 13) and decision (B, 2).
+
+        Value is left out because it needs the position to be chosen first.
+        """
+        legal = legal or {}
+
+        # Score each opponent slot from (global features, that slot's features)
+        features_per_slot = features.unsqueeze(1).expand(-1, MAX_HAND_SIZE, -1)       # (B, 13, H)
+        slot_input = torch.cat([features_per_slot, opponent_per_pos], dim=-1)         # (B, 13, H + 64)
+        position = self.position_head(slot_input).squeeze(-1)                         # (B, 13)
+
+        color = self.color_head(features)                                             # (B, 2)
+        decision = self.decision_head(features)                                       # (B, 2)
         return {
-            "color": gate(apply_mask(self.color_head(features), mask.get("color")), phase[:, 0]),
-            "position": gate(apply_mask(position, mask.get("position")), phase[:, 1]),
-            "decision": gate(apply_mask(self.decision_head(features), mask.get("decision")), phase[:, 2]),
+            "color": mask_inactive_phase(mask_illegal(color, legal.get("color")), phase[:, DRAW]),
+            "position": mask_inactive_phase(mask_illegal(position, legal.get("position")), phase[:, GUESS]),
+            "decision": mask_inactive_phase(mask_illegal(decision, legal.get("decision")), phase[:, DECISION]),
         }
 
     def value_logits(self, features: torch.Tensor, opponent_per_pos: torch.Tensor, phase: torch.Tensor,
-                     action_mask: Optional[Dict[str, torch.Tensor]], position: torch.Tensor) -> torch.Tensor:
-        """Masked + phase-gated value logits for the given (chosen) position."""
-        rows = torch.arange(features.size(0), device=features.device)
-        x = torch.cat([features, self.position_embedding(position), opponent_per_pos[rows, position]], dim=-1)
-        mask = (action_mask or {}).get("value")
-        if mask is not None and mask.dim() == 3:  # per-position mask (B, 13, 13)
-            mask = mask.to(features.device)[rows, position]
-        return gate(apply_mask(self.value_head(x), mask), phase[:, 1])
+                     legal: Optional[Dict[str, torch.Tensor]], position: torch.Tensor) -> torch.Tensor:
+        """Masked value logits (B, 13) for the card at `position` (B,)."""
+        rows = torch.arange(features.size(0), device=features.device)              # (B,)
+        chosen_slot = opponent_per_pos[rows, position]                              # (B, 64)
+        value_input = torch.cat([features, self.position_embedding(position), chosen_slot], dim=-1)  # (B, H + 32 + 64)
+        value = self.value_head(value_input)                                        # (B, 13)
+
+        legal_value = (legal or {}).get("value")
+        if legal_value is not None and legal_value.dim() == 3:
+            # Legal values depend on the slot (B, 13 slots, 13 values): take the chosen slot's row
+            legal_value = legal_value.to(features.device)[rows, position]           # (B, 13)
+        return mask_inactive_phase(mask_illegal(value, legal_value), phase[:, GUESS])
 
     def forward(self, features: torch.Tensor, phase: torch.Tensor,
                 action_mask: Optional[Dict[str, torch.Tensor]] = None,
                 selected_position: Optional[torch.Tensor] = None,
                 opponent_per_pos: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        """All four heads; value is conditioned on selected_position (0 if not given)."""
+        """All four heads. Value uses selected_position (slot 0 if not given)."""
+        batch_size, device = features.size(0), features.device
         if opponent_per_pos is None:
-            opponent_per_pos = torch.zeros(features.size(0), MAX_HAND_SIZE, 64, device=features.device)
+            opponent_per_pos = torch.zeros(batch_size, MAX_HAND_SIZE, 64, device=device)
         if selected_position is None:
-            selected_position = torch.zeros(features.size(0), dtype=torch.long, device=features.device)
-        logits = self.first_stage_logits(features, opponent_per_pos, phase, action_mask)
+            selected_position = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+        logits = self.logits_without_value(features, opponent_per_pos, phase, action_mask)
         logits["value"] = self.value_logits(features, opponent_per_pos, phase, action_mask, selected_position)
-        return {k: logits[k] for k in ACTION_KEYS}
+        return {key: logits[key] for key in ACTION_KEYS}
 
 
 class ValueHead(nn.Module):
-    """V(s) for the PPO critic."""
+    """V(s): expected return from this state, for the PPO critic."""
 
     def __init__(self, hidden_dim: int = 512) -> None:
         super().__init__()
@@ -219,6 +286,7 @@ class ValueHead(nn.Module):
                                        nn.Linear(256, 64), nn.ReLU(), nn.Linear(64, 1))
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """features (B, H) → V(s) (B, 1)."""
         return self.value_net(features)
 
 
@@ -227,7 +295,13 @@ class ValueHead(nn.Module):
 # ---------------------------------------------------------------------------
 
 class DaVinciCodePolicy(nn.Module):
-    """Encoder + belief + action heads + value head."""
+    """Encoder + belief + action heads + value head.
+
+    get_action:       pick actions while playing (collect rollouts)
+    evaluate_actions: log-probs of stored actions (PPO update)
+    Both go through the same masking and distribution code, so the
+    probabilities used to collect data are the ones PPO trains on.
+    """
 
     def __init__(self, hidden_dim: int = 512, n_heads: int = 4, n_layers: int = 4,
                  zero_init: bool = False) -> None:
@@ -238,18 +312,19 @@ class DaVinciCodePolicy(nn.Module):
         self.encoder = ObservationEncoder(hidden_dim, n_heads=n_heads, n_layers=n_layers)
         self.action_heads = PhaseGatedActionHead(hidden_dim)
         self.value_head = ValueHead(hidden_dim)
-        # Belief: distribution over each opponent slot's hidden value (trained with an auxiliary CE loss)
+        # Belief: for every opponent slot, a distribution over its 13 possible values.
+        # Trained by an auxiliary cross-entropy loss against the true hidden values.
         self.belief_head = nn.Sequential(nn.Linear(hidden_dim + 64, 128), nn.ReLU(), nn.Linear(128, NUM_VALUES))
         self.belief_to_opp_proj = nn.Linear(NUM_VALUES, 64)
 
         self.apply(self._init_weights)
-        # These two start as no-ops, so adding them never changes a loaded checkpoint's behaviour.
+        # Start these two as no-ops so they never change a loaded checkpoint's behaviour.
         for layer in (self.belief_to_opp_proj, self.encoder.my_hand_constraint_proj):
             nn.init.zeros_(layer.weight)
             nn.init.zeros_(layer.bias)
 
     def _init_weights(self, module: nn.Module) -> None:
-        """Orthogonal Linear/Conv, normal(0, 0.02) Embedding; all zeros if zero_init."""
+        """Orthogonal init for Linear/Conv, normal(0, 0.02) for Embedding (all zeros if zero_init)."""
         if self._zero_init:
             if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Embedding)):
                 nn.init.zeros_(module.weight)
@@ -263,22 +338,29 @@ class DaVinciCodePolicy(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    # -- encoding ------------------------------------------------------------
+
     def _enrich_opp_with_belief(self, features: torch.Tensor, opponent_per_pos: torch.Tensor
                                 ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Predict hidden opponent values and add them back onto the opponent slot features.
+        """Predict each hidden opponent value and add that belief onto the slot features.
 
-        Gradient routing:
-        - features is detached: the belief loss shapes the per-slot features only,
-          not the global features that the value head relies on.
-        - belief_probs is detached: the RL loss does not train the belief head.
+        features (B, H), opponent_per_pos (B, 13, 64)
         Returns (enriched opponent_per_pos (B, 13, 64), belief_logits (B, 13, 13)).
+
+        Two detaches decide which loss trains what:
+        - features.detach(): the belief loss may shape the per-slot features, but not
+          the global features that V(s) is computed from.
+        - belief_logits.detach(): the RL loss does not train the belief head.
         """
-        global_ctx = features.detach().unsqueeze(1).expand(-1, MAX_HAND_SIZE, -1)
-        belief_logits = self.belief_head(torch.cat([global_ctx, opponent_per_pos], dim=-1))
-        belief_probs = belief_logits.detach().softmax(dim=-1)
-        return opponent_per_pos + self.belief_to_opp_proj(belief_probs), belief_logits
+        global_per_slot = features.detach().unsqueeze(1).expand(-1, MAX_HAND_SIZE, -1)   # (B, 13, H)
+        belief_input = torch.cat([global_per_slot, opponent_per_pos], dim=-1)           # (B, 13, H + 64)
+        belief_logits = self.belief_head(belief_input)                                  # (B, 13, 13)
+        belief_probs = belief_logits.detach().softmax(dim=-1)                           # (B, 13, 13)
+        enriched = opponent_per_pos + self.belief_to_opp_proj(belief_probs)             # (B, 13, 64)
+        return enriched, belief_logits
 
     def _encode(self, obs: Dict[str, torch.Tensor]):
+        """Encoder + belief → (features, constraint_per_pos, enriched opponent_per_pos, belief_logits)."""
         features, constraint_per_pos, opponent_per_pos = self.encoder(obs)
         enriched_opp, belief_logits = self._enrich_opp_with_belief(features, opponent_per_pos)
         return features, constraint_per_pos, enriched_opp, belief_logits
@@ -287,71 +369,87 @@ class DaVinciCodePolicy(nn.Module):
                 action_mask: Optional[Dict[str, torch.Tensor]] = None,
                 selected_position: Optional[torch.Tensor] = None
                 ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-        """Returns (action logits, V(s), constraint_per_pos)."""
+        """Returns (logits per head, V(s) (B, 1), constraint_per_pos (B, 13, D))."""
         features, constraint_per_pos, enriched_opp, _ = self._encode(obs)
         logits = self.action_heads(features, obs["phase"].float(), action_mask,
                                    selected_position, opponent_per_pos=enriched_opp)
         return logits, self.value_head(features), constraint_per_pos
 
+    # -- acting ---------------------------------------------------------------
+
     def get_action(self, obs: Dict[str, torch.Tensor],
                    action_mask: Optional[Dict[str, torch.Tensor]] = None,
                    deterministic: bool = False
                    ) -> Tuple[np.ndarray, Dict[str, torch.Tensor], torch.Tensor]:
-        """Sample an action (rollouts / play). Position is chosen first, then value given it.
+        """Choose an action for each row (used while collecting rollouts and playing).
 
-        Returns (actions (B, 4) = [color, position, value, decision], log_probs per head, V(s)).
+        Returns:
+            actions:   (B, 4) numpy [color, position, value, decision]
+            log_probs: {head: (B,)} — 0 for heads not used in that row's phase
+            value:     V(s) (B, 1)
         """
         features, _, enriched_opp, _ = self._encode(obs)
         phase = obs["phase"]
         heads = self.action_heads
 
-        logits = heads.first_stage_logits(features, enriched_opp, phase, action_mask)
+        logits = heads.logits_without_value(features, enriched_opp, phase, action_mask)
         actions, log_probs = {}, {}
-        actions["position"], log_probs["position"] = self._sample(logits["position"], deterministic)
-        logits["value"] = heads.value_logits(features, enriched_opp, phase, action_mask, actions["position"])
-        for key in ["color", "value", "decision"]:
-            actions[key], log_probs[key] = self._sample(logits[key], deterministic)
 
-        action_array = torch.stack([actions[k] for k in ACTION_KEYS], dim=-1).cpu().numpy()
+        # GUESS is two steps: pick a position, then pick a value for that position.
+        actions["position"], log_probs["position"] = self._choose(logits["position"], deterministic)
+        logits["value"] = heads.value_logits(features, enriched_opp, phase, action_mask, actions["position"])
+
+        for key in ["color", "value", "decision"]:
+            actions[key], log_probs[key] = self._choose(logits[key], deterministic)
+
+        action_array = torch.stack([actions[k] for k in ACTION_KEYS], dim=-1).cpu().numpy()  # (B, 4)
         return action_array, log_probs, self.value_head(features)
 
-    def _sample(self, logits: torch.Tensor, deterministic: bool) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample (or argmax) one head. Rows with no legal action get action 0, log_prob 0."""
+    def _choose(self, logits: torch.Tensor, deterministic: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample (or take the argmax of) one head.
+
+        logits (B, A) → action (B,), log_prob (B,). Rows with no legal action get 0 and 0.
+        """
         action = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
         log_prob = torch.zeros(logits.size(0), device=logits.device)
-        valid, safe_logits, dist = masked_categorical(logits)
-        if valid.any():
-            chosen = safe_logits.argmax(dim=-1) if deterministic else dist.sample()
-            action[valid] = chosen
-            log_prob[valid] = dist.log_prob(chosen)
+        has_legal, safe_logits, dist = legal_action_distribution(logits)
+        if has_legal.any():
+            chosen = safe_logits.argmax(dim=-1) if deterministic else dist.sample()   # (N,)
+            action[has_legal] = chosen
+            log_prob[has_legal] = dist.log_prob(chosen)
         return action, log_prob
+
+    # -- training -------------------------------------------------------------
 
     def evaluate_actions(self, obs: Dict[str, torch.Tensor], actions: Dict[str, torch.Tensor],
                          action_mask: Optional[Dict[str, torch.Tensor]] = None):
-        """log_prob / entropy of stored actions (PPO update).
+        """Log-probs and entropies of already-taken actions, for the PPO loss.
 
-        Returns (log_probs per head, V(s), entropies per head, belief_logits (B, 13, 13)).
+        actions: {head: (B,)}
+        Returns (log_probs {head: (B,)}, V(s) (B, 1), entropies {head: (B,)}, belief_logits (B, 13, 13)).
         """
         features, _, enriched_opp, belief_logits = self._encode(obs)
         logits = self.action_heads(features, obs["phase"].float(), action_mask,
                                    selected_position=actions["position"], opponent_per_pos=enriched_opp)
+
         log_probs, entropies = {}, {}
         for key, head_logits in logits.items():
-            log_probs[key] = torch.zeros(head_logits.size(0), device=head_logits.device)
-            entropies[key] = torch.zeros(head_logits.size(0), device=head_logits.device)
-            valid, _, dist = masked_categorical(head_logits)
-            if valid.any():
-                log_probs[key][valid] = dist.log_prob(actions[key][valid])
-                entropies[key][valid] = dist.entropy()
+            batch_size, device = head_logits.size(0), head_logits.device
+            log_probs[key] = torch.zeros(batch_size, device=device)
+            entropies[key] = torch.zeros(batch_size, device=device)
+            has_legal, _, dist = legal_action_distribution(head_logits)
+            if has_legal.any():
+                log_probs[key][has_legal] = dist.log_prob(actions[key][has_legal])
+                entropies[key][has_legal] = dist.entropy()
         return log_probs, self.value_head(features), entropies, belief_logits
 
 
 def obs_to_tensor(obs: Dict[str, np.ndarray], device: torch.device = torch.device("cpu")) -> Dict[str, torch.Tensor]:
-    """Single numpy observation → batched (1, ...) tensors."""
+    """One numpy observation → batched (1, ...) tensors."""
     return {key: torch.from_numpy(val).unsqueeze(0).to(device) for key, val in obs.items()}
 
 
 def action_mask_to_tensor(mask: Dict[str, np.ndarray],
                           device: torch.device = torch.device("cpu")) -> Dict[str, torch.Tensor]:
-    """Single numpy action mask → batched (1, ...) bool tensors."""
+    """One numpy action mask → batched (1, ...) bool tensors."""
     return {key: torch.from_numpy(val).unsqueeze(0).bool().to(device) for key, val in mask.items()}
