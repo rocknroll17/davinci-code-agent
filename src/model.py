@@ -141,6 +141,10 @@ class ObservationEncoder(nn.Module):
             nn.ReLU()
         )
         
+        # Opponent's failed guesses on MY slots (row i = my slot i), added onto my tokens.
+        # Zero-initialized in DaVinciCodePolicy so loaded checkpoints start unchanged.
+        self.my_hand_constraint_proj = nn.Linear(NUM_VALUES, token_dim)
+
         # === Output projections ===
         # Opponent per-position: token_dim → 64 (position head 호환)
         self.opp_per_pos_proj = nn.Linear(token_dim, 64)
@@ -213,7 +217,7 @@ class ObservationEncoder(nn.Module):
         
         Args:
             obs: Dictionary with keys: phase, my_hand, opponent_hand,
-                 remaining_deck, constraint_matrix
+                 remaining_deck, opp_hand_constraint, my_hand_constraint
                  
         Returns:
             Tuple of:
@@ -225,7 +229,7 @@ class ObservationEncoder(nn.Module):
         my_hand = obs["my_hand"].float()             # (batch, 13, 2)
         opponent_hand = obs["opponent_hand"].float()  # (batch, 13, 2)
         remaining_deck = obs["remaining_deck"].float()
-        constraint_matrix = obs["constraint_matrix"].float()  # (batch, 13, 13)
+        constraint_matrix = obs["opp_hand_constraint"].float()  # (batch, 13, 13)
         
         batch_size = my_hand.size(0)
         device = my_hand.device
@@ -245,6 +249,7 @@ class ObservationEncoder(nn.Module):
         my_tokens = self._tokenize_hand(my_hand)  # (batch, 13, token_dim)
         my_seg = torch.zeros(batch_size, MAX_HAND_SIZE, dtype=torch.long, device=device)
         my_tokens = my_tokens + self.segment_embed(my_seg) + slot_pe
+        my_tokens = my_tokens + self.my_hand_constraint_proj(obs["my_hand_constraint"].float())
 
         # [14:27] Opponent card tokens
         opp_tokens = self._tokenize_hand(opponent_hand)  # (batch, 13, token_dim)
@@ -564,6 +569,8 @@ class DaVinciCodePolicy(nn.Module):
         # Override: zero-init belief_to_opp_proj so enrichment starts neutral → preserves checkpoint
         nn.init.zeros_(self.belief_to_opp_proj.weight)
         nn.init.zeros_(self.belief_to_opp_proj.bias)
+        nn.init.zeros_(self.encoder.my_hand_constraint_proj.weight)
+        nn.init.zeros_(self.encoder.my_hand_constraint_proj.bias)
     
     def _init_weights(self, module: nn.Module) -> None:
         """Initialize weights.

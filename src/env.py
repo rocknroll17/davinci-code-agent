@@ -42,7 +42,8 @@ class DaVinciCodeEnv(gym.Env):
         - my_hand: Player's hand (13, 2) with [color, value]
         - opponent_hand: Opponent's hand (13, 2) with hidden values
         - remaining_deck: [black_count, white_count]
-        - constraint_matrix: (13, 13) binary matrix of failed guesses
+        - opp_hand_constraint: (13, 13) ruled-out values per opponent slot (my failed guesses + revealed)
+        - my_hand_constraint: (13, 13) ruled-out values per my slot (opponent's failed guesses + revealed)
     
     Action Space:
         MultiDiscrete([2, 13, 13, 2]):
@@ -98,7 +99,10 @@ class DaVinciCodeEnv(gym.Env):
             "remaining_deck": spaces.Box(
                 low=0, high=13, shape=(2,), dtype=np.int8
             ),
-            "constraint_matrix": spaces.Box(
+            "opp_hand_constraint": spaces.Box(
+                low=0, high=1, shape=(MAX_HAND_SIZE, NUM_VALUES), dtype=np.int8
+            ),
+            "my_hand_constraint": spaces.Box(
                 low=0, high=1, shape=(MAX_HAND_SIZE, NUM_VALUES), dtype=np.int8
             )
         })

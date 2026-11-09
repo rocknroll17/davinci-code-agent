@@ -136,7 +136,8 @@ Outcome-dominated, with small shaping terms (exact values in [`src/constants.py`
 | `my_hand` | (13, 2) | my tiles `[color, value]` |
 | `opponent_hand` | (13, 2) | opponent tiles (hidden value = −1) |
 | `remaining_deck` | (2,) | remaining [black, white] |
-| `constraint_matrix` | (13, 13) | per-slot ruled-out values from play (failed guesses + revealed cards); cells `{-1, 0, 1}` |
+| `opp_hand_constraint` | (13, 13) | per opponent slot: values I ruled out (my failed guesses + revealed cards); cells `{-1, 0, 1}` |
+| `my_hand_constraint` | (13, 13) | per my slot: values the opponent ruled out (their failed guesses + revealed cards); cells `{-1, 0, 1}` |
 
 **Actions** (phase-gated heads):
 
