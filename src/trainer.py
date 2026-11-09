@@ -39,7 +39,7 @@ class PPOConfig:
     n_workers: int = 6  # rollout subproc 워커 수 = CPU 코어 수 (과구독 방지)
     episodes_per_update: int = 300 # n_envs와 동일 → ~1라운드로 수집 완료
     batch_size: int = 4096  # 1096→4096: minibatch 오버헤드↓, GPU/VRAM 활용↑ (CPU 병목 머신)
-    n_epochs: int = 8  # 에포크 늘려 데이터 재사용 극대화
+    n_epochs: int = 4  # 8→4: CleanRL 기본값, 업데이트 시간 절반 + KL 안정
     
     # PPO specific
     gamma: float = 0.99
@@ -60,7 +60,7 @@ class PPOConfig:
     zero_init: bool = False  # if True, init all default weights/biases to 0 (designated inits kept)
 
     # Performance
-    fp16: bool = False    # mixed-precision (autocast fp16 + GradScaler). Turing→fp16, not bf16.
+    fp16: bool = True     # mixed-precision (autocast fp16 + GradScaler). Turing→fp16, not bf16.
     compile: bool = False  # torch.compile the encoder (skips .any()-branchy get_action)
 
     # Reward policy
