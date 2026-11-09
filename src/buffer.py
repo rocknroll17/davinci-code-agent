@@ -26,6 +26,7 @@ class Transition:
     action_mask: Optional[Dict[str, np.ndarray]] = None
     env_id: int = 0  # Which parallel env this transition came from
     hidden_values: Optional[np.ndarray] = None  # True opponent hidden card values for belief loss
+    stream_end: bool = False  # this player's last move in the game (ends their GAE stream)
 
 
 class RolloutBuffer:
@@ -83,10 +84,10 @@ class RolloutBuffer:
         last_values_per_env: Optional[Dict[int, float]] = None
     ) -> tuple[np.ndarray, np.ndarray]:
         """
-        Compute returns and advantages using GAE, separated per environment.
+        Compute returns and advantages using GAE, separated per (env, player).
         
-        Each env's trajectory is processed independently to prevent
-        cross-env value leakage in GAE computation.
+        obs/value/reward are from the acting player's view, so each player's
+        moves form their own trajectory (the opponent's turns are environment).
         
         Args:
             last_value: Default bootstrap value for incomplete episodes
@@ -98,10 +99,10 @@ class RolloutBuffer:
         n = len(self.transitions)
         advantages = np.zeros(n, dtype=np.float32)
         
-        # Group transition indices by env_id
+        # Group transition indices by (env_id, player_id)
         env_groups: Dict[int, List[int]] = {}
         for idx, t in enumerate(self.transitions):
-            eid = t.env_id
+            eid = (t.env_id, t.player_id)
             if eid not in env_groups:
                 env_groups[eid] = []
             env_groups[eid].append(idx)
@@ -124,7 +125,7 @@ class RolloutBuffer:
                 self.transitions[i].value if not np.isnan(self.transitions[i].value) and not np.isinf(self.transitions[i].value) else 0.0
                 for i in indices
             ], dtype=np.float32)
-            env_dones = np.array([self.transitions[i].done for i in indices], dtype=bool)
+            env_dones = np.array([self.transitions[i].done or self.transitions[i].stream_end for i in indices], dtype=bool)
             
             # Append last value for bootstrapping
             env_values_ext = np.append(env_values, env_last_value)

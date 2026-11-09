@@ -76,6 +76,14 @@ class Episode:
             guess_correct=guess_correct,
         ))
 
+    def mark_terminal(self) -> None:
+        """Flag each player's last move so their GAE stream ends at this game."""
+        seen = set()
+        for m in reversed(self.moves):
+            if m.player_id not in seen:
+                seen.add(m.player_id)
+                m.transition.stream_end = True
+
     def finalize(self, winner: Optional[int]) -> None:
         """Apply all end-of-game (retroactive) rewards. No-op if no winner."""
         if winner is None:

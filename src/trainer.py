@@ -209,7 +209,9 @@ class PPOTrainer:
             "value_loss": [],
             "belief_loss": [],
             "entropy": [],  # Changed from entropy_loss
-            "total_loss": []
+            "total_loss": [],
+            "approx_kl": [],
+            "clipfrac": [],
         }
 
         # Training hooks (see src/hooks.py)
@@ -328,7 +330,11 @@ class PPOTrainer:
 
             obs = next_obs
 
-        return self._finalize_rollouts(obs, completed_rewards, completed_lengths, steps_collected)
+        # Drop games still in progress: no outcome rewards yet, and the next rollout resets them.
+        unfinished = {id(m.transition) for ep in per_env_tracking for m in ep.moves}
+        self.buffer.transitions = [t for t in self.buffer.transitions if id(t) not in unfinished]
+
+        return self._finalize_rollouts(completed_rewards, completed_lengths, steps_collected)
 
     # -------------------------------------------------------------------------
     # Rollout helpers
@@ -403,6 +409,7 @@ class PPOTrainer:
         *reset_obs* is applied to next_obs[i] when provided (threaded passes the
         result of reset_single(); subproc passes the obs from info['_reset_obs']).
         """
+        per_env_tracking[i].mark_terminal()
         # End-of-game (retroactive) rewards are computed in one place by the
         # Episode object. Monotone reward mode skips all win/lose shaping.
         if not self.config.monotone_reward:
@@ -421,23 +428,13 @@ class PPOTrainer:
 
     def _finalize_rollouts(
         self,
-        obs: Dict[str, np.ndarray],
         completed_rewards: List[float],
         completed_lengths: List[int],
         steps_collected: int
     ) -> Dict[str, float]:
         """Compute GAE, normalize advantages, log stats. Shared by both collect methods."""
-        obs_tensor = self._batch_obs_to_tensor(obs)
-        with torch.no_grad():
-            _, _, last_values = self.policy.get_action(obs_tensor)
-        
-        last_values_np = last_values.cpu().numpy().flatten()
-        last_values_per_env = {i: float(last_values_np[i]) for i in range(self.n_envs)}
-        
-        returns, advantages = self.buffer.compute_returns_and_advantages(
-            last_value=0.0,
-            last_values_per_env=last_values_per_env
-        )
+        # Only finished games are in the buffer, so no bootstrap value is needed.
+        returns, advantages = self.buffer.compute_returns_and_advantages(last_value=0.0)
         
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
@@ -495,6 +492,8 @@ class PPOTrainer:
         value_losses = []
         belief_losses = []
         entropy_losses = []
+        approx_kls = []
+        clipfracs = []
         
         # DDP: every rank must run the SAME number of minibatches per epoch,
         # otherwise the per-batch grad all_reduce counts diverge (ranks collect
@@ -532,6 +531,8 @@ class PPOTrainer:
                 policy_loss = torch.tensor(0.0, device=self.device)
                 entropy_sum = torch.tensor(0.0, device=self.device)
                 num_active_heads = 0
+                head_kls = []
+                head_clipfracs = []
                 
                 phase = batch["obs"]["phase"]
                 
@@ -569,6 +570,9 @@ class PPOTrainer:
                     ) * adv
                     
                     policy_loss = policy_loss - torch.min(surr1, surr2).mean()
+                    # Diagnostics, same as CleanRL
+                    head_kls.append(((ratio - 1) - log_ratio).mean().item())
+                    head_clipfracs.append(((ratio - 1).abs() > self.config.clip_range).float().mean().item())
                     # Entropy bonus (positive entropy = good exploration)
                     # Color head gets separate (higher) entropy weight for draw diversity
                     if key == "color":
@@ -699,6 +703,8 @@ class PPOTrainer:
                 value_losses.append(value_loss.item())
                 belief_losses.append(belief_loss.item())
                 entropy_losses.append(entropy_mean.item())  # Store actual entropy
+                approx_kls.append(np.mean(head_kls) if head_kls else 0.0)
+                clipfracs.append(np.mean(head_clipfracs) if head_clipfracs else 0.0)
         
         self.updates += 1
         
@@ -711,7 +717,9 @@ class PPOTrainer:
             "total_loss": (np.mean(policy_losses) if policy_losses else 0.0) + 
                          self.config.vf_coef * (np.mean(value_losses) if value_losses else 0.0) +
                          self.config.belief_coef * (np.mean(belief_losses) if belief_losses else 0.0) -
-                         self.config.ent_coef * (np.mean(entropy_losses) if entropy_losses else 0.0)
+                         self.config.ent_coef * (np.mean(entropy_losses) if entropy_losses else 0.0),
+            "approx_kl": np.mean(approx_kls) if approx_kls else 0.0,
+            "clipfrac": np.mean(clipfracs) if clipfracs else 0.0,
         }
         
         for key, value in mean_losses.items():
@@ -930,7 +938,9 @@ class PPOTrainer:
                       f"LR: {current_lr:.2e} | "
                       f"Policy Loss: {update_stats['policy_loss']:.4f} | "
                       f"Value Loss: {update_stats['value_loss']:.4f} | "
-                      f"Belief Loss: {update_stats['belief_loss']:.4f}")
+                      f"Belief Loss: {update_stats['belief_loss']:.4f} | "
+                      f"KL: {update_stats['approx_kl']:.4f} | "
+                      f"ClipFrac: {update_stats['clipfrac']:.3f}")
                 viz = get_visualizer()
                 if viz is not None:
                     viz.update_training_stats(
@@ -952,6 +962,8 @@ class PPOTrainer:
                     "belief_loss":         update_stats["belief_loss"],
                     "entropy":             update_stats["entropy"],
                     "total_loss":          update_stats["total_loss"],
+                    "approx_kl":           update_stats["approx_kl"],
+                    "clipfrac":            update_stats["clipfrac"],
                     "learning_rate":       current_lr,
                 })
 
