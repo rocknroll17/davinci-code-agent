@@ -1,6 +1,9 @@
 """Unit tests for Episode.finalize — retroactive reward attribution."""
 from dataclasses import dataclass
 
+import numpy as np
+import pytest
+
 from src.constants import Phase
 from src.episode import Episode
 from src.result.guess_result import GuessResult
@@ -85,3 +88,29 @@ def test_custom_reward_config_used():
     ep.finalize(winner=0)
     assert tw.reward == 7.0
     assert tl.reward == -99.0   # loser's last move
+
+
+def test_potential_shaping_telescopes_per_player():
+    """gamma=1: each player's shaping sums to Phi(end)=0 minus Phi(first own state)."""
+    def obs(opp_rev, my_rev):
+        o, m = np.zeros((13, 13)), np.zeros((13, 13))
+        o[:opp_rev] = 1
+        m[:my_rev] = 1
+        return {"opp_hand_constraint": o, "my_hand_constraint": m}
+
+    @dataclass
+    class T:
+        player_id: int
+        obs: dict
+        reward: float = 0.0
+
+    ts = [T(0, obs(0, 0)), T(1, obs(0, 0)), T(0, obs(1, 0)), T(1, obs(0, 1)), T(0, obs(2, 0))]
+    ep = Episode(0)
+    for t in ts:
+        ep.record(t, Phase.GUESS.value, None)
+    ep.apply_potential(coef=0.5, gamma=1.0)
+    assert ts[0].reward == pytest.approx(0.5)    # opp revealed 0 -> 1
+    assert ts[2].reward == pytest.approx(0.5)    # 1 -> 2
+    assert ts[4].reward == pytest.approx(-1.0)   # 2 -> terminal (Phi = 0)
+    assert ts[1].reward == pytest.approx(-0.5)   # my card got revealed in between
+    assert sum(t.reward for t in ts if t.player_id == 0) == pytest.approx(0.0)

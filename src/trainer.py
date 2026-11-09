@@ -410,6 +410,8 @@ class PPOTrainer:
         result of reset_single(); subproc passes the obs from info['_reset_obs']).
         """
         per_env_tracking[i].mark_terminal()
+        if self.config.reward_config.potential:
+            per_env_tracking[i].apply_potential(self.config.reward_config.potential, self.config.gamma)
         # End-of-game (retroactive) rewards are computed in one place by the
         # Episode object. Monotone reward mode skips all win/lose shaping.
         if not self.config.monotone_reward:

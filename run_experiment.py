@@ -27,7 +27,8 @@ import os
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Da Vinci Code experiment runner")
     p.add_argument("--exp", required=True, help="experiment name (output dir)")
-    p.add_argument("--reward-mode", choices=["normal", "monotone"], default="normal")
+    p.add_argument("--reward-mode", choices=["normal", "monotone", "outcome"], default="normal",
+                   help="outcome = win/lose only + potential-based shaping")
     p.add_argument("--n-heads", type=int, default=4, help="encoder attention heads")
     p.add_argument("--n-layers", type=int, default=4, help="encoder transformer layers")
     p.add_argument("--zero-init", action="store_true",
@@ -40,6 +41,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=8192)
     p.add_argument("--torch-threads", type=int, default=4,
                    help="intra-op torch threads per process (avoid 4-way oversubscription)")
+    p.add_argument("--gpu-mem-gb", type=float, default=0,
+                   help="if >0, cap this process's PyTorch GPU memory (to share one GPU)")
     p.add_argument("--dashboard-port", type=int, default=0,
                    help="if >0, serve the live web dashboard on this port")
     return p.parse_args()
@@ -61,9 +64,21 @@ def main() -> None:
 
     import src.utils.logger  # noqa: F401  (configures root logger)
     from src.hooks import NaNDetector
+    from src.reward_config import RewardConfig
     from src.trainer import PPOConfig, PPOTrainer
 
+    # Win/lose (+-10, same scale as the default) + potential shaping; every other shaping term off.
+    OUTCOME_REWARD = RewardConfig(
+        guess_success=0.0, joker_success=0.0, guess_fail=0.0, guess_order_violation=0.0,
+        streak_bonus_multiplier=0.0, streak_break=0.0, stop_with_determined=0.0,
+        stop_with_near_determined=0.0, draw_win=0.0, draw_lose=0.0,
+        continue_success=0.0, continue_fail=0.0, potential=0.5,
+    )
+
     torch.set_num_threads(args.torch_threads)
+    if args.gpu_mem_gb > 0 and torch.cuda.is_available():
+        total = torch.cuda.get_device_properties(0).total_memory / 2**30
+        torch.cuda.set_per_process_memory_fraction(args.gpu_mem_gb / total)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")  # 0 == the masked device
 
@@ -81,6 +96,7 @@ def main() -> None:
         n_layers=args.n_layers,
         zero_init=args.zero_init,
         monotone_reward=(args.reward_mode == "monotone"),
+        reward_config=OUTCOME_REWARD if args.reward_mode == "outcome" else RewardConfig(),
         save_dir=save_dir,
         log_dir=log_dir,
     )

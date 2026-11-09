@@ -84,6 +84,19 @@ class Episode:
                 seen.add(m.player_id)
                 m.transition.stream_end = True
 
+    def apply_potential(self, coef: float, gamma: float) -> None:
+        """Add gamma * Phi(next own state) - Phi(state) to each move (Phi = 0 at game end)."""
+        def phi(obs) -> float:
+            opp_revealed = (obs["opp_hand_constraint"] == 1).all(axis=1).sum()
+            my_revealed = (obs["my_hand_constraint"] == 1).all(axis=1).sum()
+            return coef * float(opp_revealed - my_revealed)
+
+        for pid in {m.player_id for m in self.moves}:
+            own = [m.transition for m in self.moves if m.player_id == pid]
+            phis = [phi(t.obs) for t in own] + [0.0]
+            for k, t in enumerate(own):
+                t.reward += gamma * phis[k + 1] - phis[k]
+
     def finalize(self, winner: Optional[int]) -> None:
         """Apply all end-of-game (retroactive) rewards. No-op if no winner."""
         if winner is None:

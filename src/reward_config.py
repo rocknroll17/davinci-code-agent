@@ -45,6 +45,11 @@ class RewardConfig:
     continue_success: float = 0.4        # REWARD_CONTINUE_SUCCESS
     continue_fail: float = -0.25         # REWARD_CONTINUE_FAIL
 
+    # --- potential-based shaping (Ng et al. 1999; keeps the optimal policy) ---
+    # Phi(s) = potential * (opponent cards revealed - my cards revealed), added as
+    # gamma * Phi(s') - Phi(s) on each player's own stream. 0 = off.
+    potential: float = 0.0
+
     def to_dict(self) -> dict:
         """Plain-dict form for serialization (checkpoint config / JSON logs)."""
         return asdict(self)
