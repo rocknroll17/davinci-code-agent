@@ -29,7 +29,7 @@ import numpy as np
 import torch
 
 from src.constants import ACTION_KEYS, CHECKPOINT_BEST
-from src.model import DaVinciCodePolicy, action_mask_to_tensor, obs_to_tensor
+from src.model import DaVinciCodePolicy, action_mask_to_tensor, load_weights, obs_to_tensor
 
 
 class ModelAgent:
@@ -95,10 +95,7 @@ class ModelAgent:
         n_layers = cfg.get("n_layers") or n_layers
         policy = DaVinciCodePolicy(hidden_dim=hidden_dim, n_heads=n_heads, n_layers=n_layers).to(device)
 
-        state_dict = checkpoint.get("policy_state_dict", checkpoint)
-        # strict=False tolerates architecture additions (e.g. slot_pos_embed) when
-        # loading older checkpoints; missing params keep their fresh init.
-        policy.load_state_dict(state_dict, strict=False)
+        load_weights(policy, checkpoint.get("policy_state_dict", checkpoint))
 
         agent = cls(policy, device)
         agent._checkpoint_path = path

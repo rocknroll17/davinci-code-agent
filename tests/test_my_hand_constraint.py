@@ -33,13 +33,30 @@ def test_mirrors_opponents_own_constraint_matrix(env, agent):
         np.testing.assert_array_equal(obs["my_hand_constraint"], opponent._constraint_matrix)
 
 
-def test_new_input_is_a_no_op_at_init(env):
+def test_input_is_its_own_token_group(env):
+    """my_hand_constraint is a separate 13-token group that the policy actually reads."""
     torch.manual_seed(0)
     policy = DaVinciCodePolicy().eval()
     obs, _ = env.reset()
     t = obs_to_tensor(obs)
     with torch.no_grad():
         _, v1, _ = policy(t)
-        t["my_hand_constraint"] = torch.ones_like(t["my_hand_constraint"])
+        t["my_hand_constraint"][0, 0] = 1  # opponent ruled out every value of my slot 0
         _, v2, _ = policy(t)
-    assert torch.equal(v1, v2)
+    assert not torch.equal(v1, v2)
+
+
+def test_older_checkpoint_loads_into_new_layout():
+    """Weights of the 42-token model carry over; only the new parts start fresh."""
+    from src.model import load_weights
+    torch.manual_seed(0)
+    old = DaVinciCodePolicy().state_dict()
+    old = {k: v for k, v in old.items() if not k.startswith("encoder.my_constraint_proj")}
+    old["encoder.segment_embed.weight"] = old["encoder.segment_embed.weight"][:5].clone()
+
+    torch.manual_seed(1)
+    policy = DaVinciCodePolicy()
+    fresh = load_weights(policy, old)
+    assert set(fresh) == {"encoder.segment_embed.weight"} | {
+        k for k in policy.state_dict() if k.startswith("encoder.my_constraint_proj")}
+    assert torch.equal(policy.state_dict()["encoder.segment_embed.weight"][:5], old["encoder.segment_embed.weight"])

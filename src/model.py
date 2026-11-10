@@ -4,7 +4,7 @@ Policy network for Da Vinci Code.
 Data flow (B = batch size, 13 = hand slots, 13 = card values 0-12):
 
     observation
-      └─► ObservationEncoder (Transformer over 42 tokens)
+      └─► ObservationEncoder (Transformer over 55 tokens)
             ├─► features          (B, 512)      summary of the whole game state
             └─► opponent_slots    (B, 13, 64)   one vector per opponent card slot
     opponent_slots ─► belief head ─► "what value is each hidden opponent card?"  (B, 13, 13)
@@ -30,7 +30,7 @@ from torch.distributions import Categorical
 from src.constants import MASK_VALUE, MAX_HAND_SIZE, NUM_VALUES
 
 # Token groups, used as segment-embedding ids
-SEG_MY, SEG_OPP, SEG_PHASE, SEG_DECK, SEG_CONSTRAINT = 0, 1, 2, 3, 4
+SEG_MY, SEG_OPP, SEG_PHASE, SEG_DECK, SEG_CONSTRAINT, SEG_MY_CONSTRAINT = 0, 1, 2, 3, 4, 5
 
 # Columns of the phase one-hot
 DRAW, GUESS, DECISION = 0, 1, 2
@@ -87,17 +87,18 @@ def legal_action_distribution(logits: torch.Tensor) -> Tuple[torch.Tensor, torch
 # ---------------------------------------------------------------------------
 
 class ObservationEncoder(nn.Module):
-    """Turn an observation into 42 tokens and run a Transformer over them.
+    """Turn an observation into 55 tokens and run a Transformer over them.
 
     Token layout (index: content):
         0       CLS — its output becomes `features`
-        1-13    my cards            (+ what the opponent ruled out for each of them)
-        14-26   opponent cards      (hidden values show up as "hidden")
-        27-39   constraints         (what I ruled out for each opponent card)
-        40      phase
-        41      deck                (cards left per color)
-    Slot i of my cards, opponent cards and constraints share one slot embedding,
-    so attention can tell that "constraint i" belongs to "opponent card i".
+        1-13    my cards
+        14-26   opponent cards       (hidden values show up as "hidden")
+        27-39   opponent constraints (what I ruled out for each opponent card)
+        40-52   my constraints       (what the opponent ruled out for each of my cards)
+        53      phase
+        54      deck                 (cards left per color)
+    Slot i of every 13-token group shares one slot embedding, so attention can tell
+    that "opponent constraint i" belongs to "opponent card i" (and likewise for mine).
     """
 
     def __init__(self, hidden_dim: int = 512, token_dim: int = 128,
@@ -112,7 +113,7 @@ class ObservationEncoder(nn.Module):
         self.color_embed = nn.Embedding(3, 16)
         self.value_embed = nn.Embedding(15, 32)
         self.position_embed = nn.Embedding(MAX_HAND_SIZE, 16)
-        self.segment_embed = nn.Embedding(5, token_dim)
+        self.segment_embed = nn.Embedding(6, token_dim)
         self.slot_pos_embed = nn.Embedding(MAX_HAND_SIZE, token_dim)
         self.cls_token = nn.Parameter(torch.randn(1, 1, token_dim))
         self.card_proj = nn.Sequential(nn.Linear(16 + 32 + 16 + 1, token_dim),
@@ -125,11 +126,11 @@ class ObservationEncoder(nn.Module):
                                            batch_first=True, norm_first=True)
         self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
 
-        # One 13-value row per slot → one token
+        # One 13-value row per slot → one token (opponent's cards / my cards)
         self.constraint_proj = nn.Sequential(nn.Linear(NUM_VALUES, token_dim),
                                              nn.LayerNorm(token_dim), nn.ReLU())
-        # Zero-initialized in DaVinciCodePolicy, so loading an older checkpoint changes nothing.
-        self.my_hand_constraint_proj = nn.Linear(NUM_VALUES, token_dim)
+        self.my_constraint_proj = nn.Sequential(nn.Linear(NUM_VALUES, token_dim),
+                                                nn.LayerNorm(token_dim), nn.ReLU())
 
         self.opp_per_pos_proj = nn.Linear(token_dim, 64)
         self.fusion = nn.Sequential(nn.Linear(token_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.ReLU(),
@@ -139,7 +140,7 @@ class ObservationEncoder(nn.Module):
         """
         Returns:
             features:           (B, hidden_dim)  from the CLS token
-            constraint_per_pos: (B, 13, token_dim) constraint tokens before attention
+            constraint_per_pos: (B, 13, token_dim) opponent-constraint tokens before attention
             opponent_per_pos:   (B, 13, 64)      opponent card tokens after attention
         """
         my_hand = obs["my_hand"].float()               # (B, 13, 2) [color, value]
@@ -150,11 +151,8 @@ class ObservationEncoder(nn.Module):
         slots = torch.arange(MAX_HAND_SIZE, device=device).expand(batch_size, -1)  # (B, 13)
         slot_pe = self.slot_pos_embed(slots)                                        # (B, 13, D)
 
-        # My cards, plus what the opponent has ruled out for each of them
         my_tokens = self._tokenize_hand(my_hand)                                    # (B, 13, D)
         my_tokens = my_tokens + self._segment(batch_size, MAX_HAND_SIZE, SEG_MY, device) + slot_pe
-        my_ruled_out = self.my_hand_constraint_proj(obs["my_hand_constraint"].float())  # (B, 13, D)
-        my_tokens = my_tokens + my_ruled_out
 
         opp_tokens = self._tokenize_hand(opponent_hand)                             # (B, 13, D)
         opp_tokens = opp_tokens + self._segment(batch_size, MAX_HAND_SIZE, SEG_OPP, device) + slot_pe
@@ -163,22 +161,27 @@ class ObservationEncoder(nn.Module):
         constraint_per_pos = self.constraint_proj(obs["opp_hand_constraint"].float())  # (B, 13, D)
         con_tokens = constraint_per_pos + self._segment(batch_size, MAX_HAND_SIZE, SEG_CONSTRAINT, device) + slot_pe
 
+        # What the opponent has ruled out for each of my cards
+        my_con_tokens = self.my_constraint_proj(obs["my_hand_constraint"].float())  # (B, 13, D)
+        my_con_tokens = my_con_tokens + self._segment(batch_size, MAX_HAND_SIZE, SEG_MY_CONSTRAINT, device) + slot_pe
+
         phase_token = self.phase_proj(obs["phase"].float()).unsqueeze(1)           # (B, 1, D)
         phase_token = phase_token + self._segment(batch_size, 1, SEG_PHASE, device)
         deck_token = self.deck_proj(obs["remaining_deck"].float()).unsqueeze(1)     # (B, 1, D)
         deck_token = deck_token + self._segment(batch_size, 1, SEG_DECK, device)
 
         cls = self.cls_token.expand(batch_size, -1, -1)                             # (B, 1, D)
-        tokens = torch.cat([cls, my_tokens, opp_tokens, con_tokens, phase_token, deck_token], dim=1)  # (B, 42, D)
+        tokens = torch.cat([cls, my_tokens, opp_tokens, con_tokens, my_con_tokens,
+                            phase_token, deck_token], dim=1)                        # (B, 55, D)
 
         # Attention ignores empty card slots (color < 0); a constraint token is empty
-        # exactly when its opponent slot is.
+        # exactly when its card slot is.
         my_empty = my_hand[:, :, 0] < 0                                             # (B, 13)
         opp_empty = opponent_hand[:, :, 0] < 0                                      # (B, 13)
         never = torch.zeros(batch_size, 1, dtype=torch.bool, device=device)        # (B, 1)
-        padding = torch.cat([never, my_empty, opp_empty, opp_empty, never, never], dim=1)  # (B, 42)
+        padding = torch.cat([never, my_empty, opp_empty, opp_empty, my_empty, never, never], dim=1)  # (B, 55)
 
-        tokens = self.transformer(tokens, src_key_padding_mask=padding)             # (B, 42, D)
+        tokens = self.transformer(tokens, src_key_padding_mask=padding)             # (B, 55, D)
 
         features = self.fusion(tokens[:, 0])                                        # (B, hidden_dim)
         opp_out = tokens[:, 1 + MAX_HAND_SIZE:1 + 2 * MAX_HAND_SIZE]                # (B, 13, D)
@@ -318,10 +321,9 @@ class DaVinciCodePolicy(nn.Module):
         self.belief_to_opp_proj = nn.Linear(NUM_VALUES, 64)
 
         self.apply(self._init_weights)
-        # Start these two as no-ops so they never change a loaded checkpoint's behaviour.
-        for layer in (self.belief_to_opp_proj, self.encoder.my_hand_constraint_proj):
-            nn.init.zeros_(layer.weight)
-            nn.init.zeros_(layer.bias)
+        # Start the belief residual as a no-op so it does not disturb early training.
+        nn.init.zeros_(self.belief_to_opp_proj.weight)
+        nn.init.zeros_(self.belief_to_opp_proj.bias)
 
     def _init_weights(self, module: nn.Module) -> None:
         """Orthogonal init for Linear/Conv, normal(0, 0.02) for Embedding (all zeros if zero_init)."""
@@ -442,6 +444,33 @@ class DaVinciCodePolicy(nn.Module):
                 log_probs[key][has_legal] = dist.log_prob(actions[key][has_legal])
                 entropies[key][has_legal] = dist.entropy()
         return log_probs, self.value_head(features), entropies, belief_logits
+
+
+def load_weights(policy: nn.Module, state_dict: Dict[str, torch.Tensor]) -> list:
+    """Load a checkpoint's weights into `policy`, also from older architectures.
+
+    - torch.compile's "._orig_mod." key wrapper is ignored on both sides.
+    - Same shape: copied.
+    - An embedding table that has grown (more rows, e.g. a new token segment):
+      the old rows are copied, the new rows keep their fresh init.
+    - Anything else that does not fit keeps its fresh init.
+    Returns the parameter names that kept (some of) their fresh init.
+    """
+    norm = lambda k: k.replace("._orig_mod.", ".")
+    saved = {norm(k): v for k, v in state_dict.items()}
+    own = policy.state_dict()
+    fresh = []
+    with torch.no_grad():
+        for name, param in own.items():
+            old = saved.get(norm(name))
+            if old is not None and old.shape == param.shape:
+                param.copy_(old)
+            elif old is not None and old.dim() == 2 and old.shape[1] == param.shape[1] and old.shape[0] < param.shape[0]:
+                param[:old.shape[0]].copy_(old)
+                fresh.append(name)
+            else:
+                fresh.append(name)
+    return fresh
 
 
 def obs_to_tensor(obs: Dict[str, np.ndarray], device: torch.device = torch.device("cpu")) -> Dict[str, torch.Tensor]:

@@ -33,22 +33,18 @@ def masked_argmax(logits, mask):
 
 
 class OnnxAgent:
-    """Deployed model. Its obs predates the my_hand_constraint input."""
+    """Deployed model. Feeds whichever obs inputs its ONNX graph declares."""
 
     def __init__(self, path):
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = 1
         self.session = ort.InferenceSession(path, opts, providers=["CPUExecutionProvider"])
+        self.inputs = {i.name for i in self.session.get_inputs()}
 
     def _run(self, obs, i, position):
-        feeds = {
-            "phase": obs["phase"][i:i + 1].astype(np.float32),
-            "my_hand": obs["my_hand"][i:i + 1].astype(np.float32),
-            "opponent_hand": obs["opponent_hand"][i:i + 1].astype(np.float32),
-            "constraint_matrix": obs["opp_hand_constraint"][i:i + 1].astype(np.float32),
-            "remaining_deck": obs["remaining_deck"][i:i + 1].astype(np.float32),
-            "selected_position": np.array([position], dtype=np.int64),
-        }
+        obs = dict(obs, constraint_matrix=obs["opp_hand_constraint"])  # older graphs use this name
+        feeds = {k: obs[k][i:i + 1].astype(np.float32) for k in self.inputs if k != "selected_position"}
+        feeds["selected_position"] = np.array([position], dtype=np.int64)
         color, pos, value, decision = self.session.run(
             ["color_logits", "position_logits", "value_logits", "decision_logits"], feeds)
         return color[0], pos[0], value[0], decision[0]

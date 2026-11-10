@@ -22,7 +22,7 @@ from src import ppo_loss
 from src.buffer import RolloutBuffer, Transition
 from src.constants import Phase
 from src.episode import Episode
-from src.model import DaVinciCodePolicy
+from src.model import DaVinciCodePolicy, load_weights
 from src.result.result import Result
 from src.reward_config import RewardConfig
 from src.vec_env import SubprocVecEnv, VectorDaVinciEnv
@@ -642,35 +642,9 @@ class PPOTrainer:
         # loader rejects. Matches ModelAgent.from_checkpoint.
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
-        # Normalize torch.compile's "_orig_mod." wrapper on BOTH sides so a
-        # checkpoint loads regardless of whether either it or the current model
-        # was compiled. We match on normalized names, then write into the real
-        # (possibly-prefixed) model keys.
-        def _norm(k: str) -> str:
-            return k.replace("._orig_mod.", ".")
-
-        saved_state = {_norm(k): v for k, v in checkpoint["policy_state_dict"].items()}
-        model_state = self.policy.state_dict()
-        norm_to_real = {_norm(k): k for k in model_state}
-
-        # Filter out keys whose shape changed (e.g., belief_head after architecture update)
-        # strict=False only handles missing/unexpected keys, not shape mismatches
-        compatible = {}
-        shape_mismatch = []
-        for nk, v in saved_state.items():
-            rk = norm_to_real.get(nk)
-            if rk is None:
-                continue
-            if v.shape == model_state[rk].shape:
-                compatible[rk] = v
-            else:
-                shape_mismatch.append(rk)
-        if shape_mismatch:
-            print(f"Shape mismatch — re-initialized: {shape_mismatch}")
-
-        missing, unexpected = self.policy.load_state_dict(compatible, strict=False)
-        if missing:
-            print(f"New parameters initialized randomly: {missing}")
+        fresh = load_weights(self.policy, checkpoint["policy_state_dict"])
+        if fresh:
+            print(f"Parameters kept (some) fresh init: {fresh}")
         
         if self.config.reset_optimizer_on_load:
             # Reset optimizer with fresh state (useful after finetune→normal transition)
