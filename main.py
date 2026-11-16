@@ -4,8 +4,6 @@ Da Vinci Code Self-Play Training
 python main.py 실행하면 바로 학습 시작
 python main.py --no-viz 로 시각화 없이 학습
 python main.py --reset-optimizer 로 optimizer 초기화 후 학습
-python main.py --dashboard 로 브라우저 대시보드 활성화 (기본: 포트 6006)
-python main.py --dashboard-port 8080 로 포트 변경
 """
 
 import os
@@ -14,6 +12,7 @@ import sys
 import torch
 
 import src.utils.logger  # noqa: F401  (configures root logger on import)
+from src.hooks import NaNDetector
 from src.trainer import PPOConfig, PPOTrainer
 from src.visualizer import create_visualizer
 
@@ -26,14 +25,6 @@ def main():
     # 옵션 파싱
     use_viz = "--no-viz" not in sys.argv
     reset_optimizer = "--reset-optimizer" in sys.argv
-    use_dashboard = "--dashboard" in sys.argv
-
-    # --dashboard-port <n>
-    dashboard_port = 6006
-    if "--dashboard-port" in sys.argv:
-        idx = sys.argv.index("--dashboard-port")
-        if idx + 1 < len(sys.argv):
-            dashboard_port = int(sys.argv[idx + 1])
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -53,25 +44,7 @@ def main():
     
     optimizer_msg = "🔄 Optimizer reset: ON" if reset_optimizer else ""
 
-    # ── 대시보드 ──────────────────────────────────────────────────────────────
-    if use_dashboard:
-        try:
-            from src.dashboard.server import DashboardServer
-            from src.hooks import DashboardHook, NaNDetector
-
-            dashboard = DashboardServer(host="0.0.0.0", port=dashboard_port)
-            dashboard.start()
-            trainer.register_hook(DashboardHook(dashboard))
-            trainer.register_hook(NaNDetector())
-            print(f"[Dashboard] http://localhost:{dashboard_port}")
-        except ImportError as e:
-            print(f"Warning: Could not start dashboard (missing dependencies: {e}). "
-                  "Install with: pip install fastapi uvicorn[standard]")
-            use_dashboard = False
-    else:
-        # Even without dashboard, register NaN detector by default
-        from src.hooks import NaNDetector
-        trainer.register_hook(NaNDetector())
+    trainer.register_hook(NaNDetector())
 
     # 시각화 시작
     viz = None
@@ -83,8 +56,6 @@ def main():
             viz.add_log(f"Device: {device}")
             if optimizer_msg:
                 viz.add_log(optimizer_msg)
-            if use_dashboard:
-                viz.add_log(f"Dashboard: http://localhost:{dashboard_port}")
         except Exception as e:
             print(f"Warning: Could not start visualizer: {e}")
             use_viz = False

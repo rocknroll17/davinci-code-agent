@@ -9,8 +9,7 @@ python -m compileall -q src main.py        # byte-compile
 python scripts/ci_smoke.py                 # 1-step PPO training smoke (CPU)
 ```
 
-CI (`.github/workflows/ci.yml`) runs these on every push/PR, and CodeQL
-(`.github/workflows/codeql.yml`) runs a security scan.
+CI (`.github/workflows/ci.yml`) runs these on every push/PR.
 
 ## Commit messages
 

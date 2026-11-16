@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
 """
-Single-experiment training runner for the 4-way comparison study.
+Train one named experiment. Checkpoints and logs go to experiments/<name>/, and the
+run resumes from experiments/<name>/checkpoints/latest.pt if it exists.
 
-Each experiment is one independent self-play training run, pinned to one GPU,
-writing its own checkpoints/logs under experiments/<name>/. The four variants:
+  python run_experiment.py --exp my_run --n-layers 2 --reward-mode outcome
 
-  1. baseline   — original model, original reward
-  2. monotone   — monotone reward (no win/lose signal, only per-guess reward)
-  3. heads      — encoder transformer with more attention heads
-  4. layers     — encoder transformer with an extra layer
+Several GPUs (one process per GPU, gradients averaged across them):
 
-Nothing else is changed between runs.
-
-Example
--------
-  python run_experiment.py --exp baseline --device-id 0
-  python run_experiment.py --exp monotone --reward-mode monotone --device-id 1
-  python run_experiment.py --exp heads --n-heads 8 --device-id 2
-  python run_experiment.py --exp layers --n-layers 5 --device-id 3
+  torchrun --nproc_per_node=4 run_experiment.py --exp my_run
 """
 
 import argparse
@@ -47,8 +37,6 @@ def parse_args() -> argparse.Namespace:
                    help="intra-op torch threads per process (avoid 4-way oversubscription)")
     p.add_argument("--gpu-mem-gb", type=float, default=0,
                    help="if >0, cap this process's PyTorch GPU memory (to share one GPU)")
-    p.add_argument("--dashboard-port", type=int, default=0,
-                   help="if >0, serve the live web dashboard on this port")
     return p.parse_args()
 
 
@@ -57,7 +45,12 @@ def main() -> None:
 
     # --- Pin GPU + reward mode BEFORE importing torch / building env workers ---
     # The reward flag must be in the environment before SubprocVecEnv forks workers.
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
+    # Under torchrun each process gets RANK / LOCAL_RANK / WORLD_SIZE and its own GPU.
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if world_size == 1:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
     if args.reward_mode == "monotone":
         os.environ["DVC_MONOTONE_REWARD"] = "1"
     # Limit BLAS / OpenMP threads so 4 concurrent runs don't each grab all cores.
@@ -84,7 +77,10 @@ def main() -> None:
         total = torch.cuda.get_device_properties(0).total_memory / 2**30
         torch.cuda.set_per_process_memory_fraction(args.gpu_mem_gb / total)
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")  # 0 == the masked device
+    # Single process: cuda:0 is the GPU picked by --device-id (masked above).
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    if world_size > 1:
+        torch.distributed.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
 
     exp_dir = os.path.join("experiments", args.exp)
     save_dir = os.path.join(exp_dir, "checkpoints")
@@ -109,9 +105,29 @@ def main() -> None:
         log_dir=log_dir,
     )
 
+    if rank == 0:
+        print_summary(args, config, exp_dir, world_size)
+
+    trainer = PPOTrainer(config, device, rank=rank, world_size=world_size)
+    if rank == 0:
+        trainer.register_hook(NaNDetector())
+
+    # Resume if a checkpoint already exists for this experiment.
+    latest = os.path.join(save_dir, "latest.pt")
+    if os.path.exists(latest):
+        trainer.load(latest)
+        if rank == 0:
+            print(f"Resumed from timestep {trainer.timesteps * world_size:,}")
+
+    trainer.train()
+    if world_size > 1:
+        torch.distributed.destroy_process_group()
+
+
+def print_summary(args, config, exp_dir: str, world_size: int) -> None:
     print("=" * 70)
     print(f"Experiment: {args.exp}")
-    print(f"  device           : cuda:{args.device_id}")
+    print(f"  processes (GPUs) : {world_size}")
     print(f"  reward_mode      : {args.reward_mode} (monotone={config.monotone_reward})")
     print(f"  n_heads/n_layers : {config.n_heads} / {config.n_layers}")
     print(f"  zero_init        : {config.zero_init}")
@@ -120,29 +136,6 @@ def main() -> None:
     print(f"  total_timesteps  : {config.total_timesteps:,}")
     print(f"  output dir       : {exp_dir}")
     print("=" * 70)
-
-    trainer = PPOTrainer(config, device)
-    trainer.register_hook(NaNDetector())
-
-    # Live web dashboard (per-experiment port) so training is watchable in a browser.
-    if args.dashboard_port > 0:
-        try:
-            from src.dashboard.server import DashboardServer
-            from src.hooks import DashboardHook
-            dashboard = DashboardServer(host="0.0.0.0", port=args.dashboard_port)
-            dashboard.start()
-            trainer.register_hook(DashboardHook(dashboard))
-            print(f"[Dashboard] {args.exp}: http://localhost:{args.dashboard_port}")
-        except Exception as e:
-            print(f"[Dashboard] disabled ({e})")
-
-    # Resume if a checkpoint already exists for this experiment.
-    latest = os.path.join(save_dir, "latest.pt")
-    if os.path.exists(latest):
-        trainer.load(latest)
-        print(f"Resumed from timestep {trainer.timesteps:,}")
-
-    trainer.train()
 
 
 if __name__ == "__main__":

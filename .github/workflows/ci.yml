@@ -62,7 +62,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Byte-compile
-        run: python -m compileall -q src main.py eval.py play.py
+        run: python -m compileall -q src main.py play.py
 
       - name: Training smoke (1 PPO update)
         run: python scripts/ci_smoke.py
