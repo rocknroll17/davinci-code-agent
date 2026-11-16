@@ -49,10 +49,6 @@ class Card(ABC):
         """Check if this card is a joker."""
         return self.value == CardValue.JOKER
     
-    @property
-    def is_number(self) -> bool:
-        """Check if this card is a numbered card (not a joker)."""
-        return self.value != CardValue.JOKER
 
     def to_observation(self, hidden: bool = False) -> list[int]:
         """
@@ -82,21 +78,3 @@ class Card(ABC):
     def to_string(self) -> str:
         """String representation of the card."""
         return f"{self.color.to_string()} {self.value.to_string()}"
-
-
-class OpponentCard(Card):
-    """
-    Represents a card from opponent's perspective.
-    Hides value if not revealed.
-    """
-    def __init__(self, card: Card) -> None:
-        super().__init__(color=card.color, value=card.value if card.is_revealed else CardValue.HIDDEN, is_revealed=card.is_revealed)
-
-    def __post_init__(self) -> None:
-        """Validate card properties after initialization."""
-        if isinstance(self.value, int):
-            self.value = CardValue(self.value)
-        if self.color not in (Color.BLACK, Color.WHITE):
-            raise ValueError(f"Invalid color: {self.color}")
-        if not (CardValue.HIDDEN <= self.value <= CardValue.JOKER):
-            raise ValueError(f"Invalid value: {self.value}")

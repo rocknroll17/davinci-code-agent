@@ -16,5 +16,4 @@ COPY . .
 #   docker run -v $(pwd)/checkpoints:/app/checkpoints -v $(pwd)/logs:/app/logs ...
 VOLUME ["/app/checkpoints", "/app/logs"]
 
-# 컨테이너 환경엔 TTY가 없으므로 Rich 시각화 끄고 학습
-CMD ["python", "main.py", "--no-viz"]
+CMD ["python", "main.py"]

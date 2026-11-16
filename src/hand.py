@@ -87,45 +87,6 @@ class Hand(list[Card]):
 
         self.last_drawn_card = None
 
-    def _is_valid_position(self, new_card: Card, pos: int) -> bool:
-        """새 카드가 pos 위치에 들어갈 수 있는지 확인"""
-        n = len(self)
-        
-        # 왼쪽 범위 결정 (왼쪽에서 가장 가까운 비조커 카드)
-        left_bound = None  # (value, color) or None
-        for i in range(pos - 1, -1, -1):
-            if not self[i].is_joker:
-                left_bound = (self[i].value, self[i].color)
-                break
-        
-        # 오른쪽 범위 결정 (오른쪽에서 가장 가까운 비조커 카드)
-        right_bound = None  # (value, color) or None
-        for i in range(pos, n):
-            if not self[i].is_joker:
-                right_bound = (self[i].value, self[i].color)
-                break
-        
-        new_val = new_card.value
-        new_col = new_card.color.value  # Color enum to int
-        
-        # 왼쪽 조건: new_card > left_bound
-        if left_bound:
-            lv, lc = left_bound
-            if new_val < lv:
-                return False
-            if new_val == lv and new_col <= lc:
-                return False
-        
-        # 오른쪽 조건: new_card < right_bound
-        if right_bound:
-            rv, rc = right_bound
-            if new_val > rv:
-                return False
-            if new_val == rv and new_col >= rc:
-                return False
-        
-        return True
-
     def to_observation(self, hidden: bool = False) -> np.ndarray:
         """
         Convert hand to observation format.

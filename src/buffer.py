@@ -26,6 +26,7 @@ class Transition:
     action_mask: Optional[Dict[str, np.ndarray]] = None
     env_id: int = 0  # Which parallel env this transition came from
     hidden_values: Optional[np.ndarray] = None  # True opponent hidden card values for belief loss
+    stream_end: bool = False  # this player's last move in the game (ends their GAE stream)
 
 
 class RolloutBuffer:
@@ -80,82 +81,64 @@ class RolloutBuffer:
     def compute_returns_and_advantages(
         self,
         last_value: float = 0.0,
-        last_values_per_env: Optional[Dict[int, float]] = None
+        last_values_per_env: Optional[Dict[tuple, float]] = None
     ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Compute returns and advantages using GAE, separated per environment.
-        
-        Each env's trajectory is processed independently to prevent
-        cross-env value leakage in GAE computation.
-        
-        Args:
-            last_value: Default bootstrap value for incomplete episodes
-            last_values_per_env: Per-env bootstrap values {env_id: value}
-            
-        Returns:
-            Tuple of (returns, advantages) arrays
-        """
-        n = len(self.transitions)
-        advantages = np.zeros(n, dtype=np.float32)
-        
-        # Group transition indices by env_id
-        env_groups: Dict[int, List[int]] = {}
-        for idx, t in enumerate(self.transitions):
-            eid = t.env_id
-            if eid not in env_groups:
-                env_groups[eid] = []
-            env_groups[eid].append(idx)
-        
-        # Compute GAE separately for each env's trajectory
-        for eid, indices in env_groups.items():
-            # Get bootstrap value for this env
-            if last_values_per_env is not None and eid in last_values_per_env:
-                env_last_value = last_values_per_env[eid]
-            else:
-                env_last_value = last_value
-            env_last_value = float(env_last_value) if not np.isnan(env_last_value) and not np.isinf(env_last_value) else 0.0
-            
-            env_n = len(indices)
-            env_rewards = np.array([
-                self.transitions[i].reward if not np.isnan(self.transitions[i].reward) and not np.isinf(self.transitions[i].reward) else 0.0
-                for i in indices
-            ], dtype=np.float32)
-            env_values = np.array([
-                self.transitions[i].value if not np.isnan(self.transitions[i].value) and not np.isinf(self.transitions[i].value) else 0.0
-                for i in indices
-            ], dtype=np.float32)
-            env_dones = np.array([self.transitions[i].done for i in indices], dtype=bool)
-            
-            # Append last value for bootstrapping
-            env_values_ext = np.append(env_values, env_last_value)
-            
-            last_gae = 0.0
-            env_advantages = np.zeros(env_n, dtype=np.float32)
-            
-            for t in reversed(range(env_n)):
-                if env_dones[t]:
-                    next_value = 0.0
-                    last_gae = 0.0
-                else:
-                    next_value = env_values_ext[t + 1]
-                delta = env_rewards[t] + self.gamma * next_value - env_values[t]
-                last_gae = delta + self.gamma * self.gae_lambda * last_gae
-                env_advantages[t] = last_gae if not np.isnan(last_gae) and not np.isinf(last_gae) else 0.0
-            
-            # Write back to global advantages array
-            for local_idx, global_idx in enumerate(indices):
-                advantages[global_idx] = env_advantages[local_idx]
-        
-        # Compute returns
-        values = np.array([
-            t.value if not np.isnan(t.value) and not np.isinf(t.value) else 0.0
-            for t in self.transitions
-        ], dtype=np.float32)
-        returns = advantages + values
-        returns = np.where(np.isnan(returns) | np.isinf(returns), 0.0, returns)
+        """GAE advantages and returns for every stored transition.
 
+        Self-play: both seats of a game are stored in one buffer, but each
+        transition's obs, value and reward are from the *acting* player's point
+        of view. So GAE runs separately on each (env_id, player_id) stream — for a
+        player, the opponent's turns are just part of the environment.
+
+        A stream ends on `done` (the move that ended the game) or `stream_end`
+        (this player's own last move of the game). A stream that does not end
+        bootstraps from last_values_per_env[(env_id, player_id)], else last_value.
+
+        Returns (returns, advantages), each (N,) float32 in buffer order.
+        NaN/Inf rewards, values and advantages are replaced by 0.
+        """
+        advantages = np.zeros(len(self.transitions), dtype=np.float32)
+
+        streams: Dict[tuple, List[int]] = {}  # (env_id, player_id) -> buffer indices, in order
+        for idx, t in enumerate(self.transitions):
+            streams.setdefault((t.env_id, t.player_id), []).append(idx)
+
+        for key, indices in streams.items():
+            bootstrap = last_value
+            if last_values_per_env is not None and key in last_values_per_env:
+                bootstrap = last_values_per_env[key]
+            stream_adv = self._gae([self.transitions[i] for i in indices], _finite_or_zero(bootstrap))
+            advantages[indices] = stream_adv
+
+        values = np.array([_finite_or_zero(t.value) for t in self.transitions], dtype=np.float32)
+        returns = advantages + values  # what V(s) is trained towards
+        returns = np.where(np.isnan(returns) | np.isinf(returns), 0.0, returns)
         return returns, advantages
-    
+
+    def _gae(self, stream: List[Transition], bootstrap: float) -> np.ndarray:
+        """GAE over one player's transitions (in time order) → advantages (T,) float32.
+
+            delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)        (V after an ending move = 0)
+            A_t     = delta_t + gamma * lambda * A_{t+1}
+        """
+        rewards = np.array([_finite_or_zero(t.reward) for t in stream], dtype=np.float32)
+        values = np.array([_finite_or_zero(t.value) for t in stream], dtype=np.float32)
+        ends = np.array([t.done or t.stream_end for t in stream], dtype=bool)
+        next_values = np.append(values, bootstrap)  # V(s_{t+1}); the last one is the bootstrap
+
+        advantages = np.zeros(len(stream), dtype=np.float32)
+        last_gae = 0.0
+        for t in reversed(range(len(stream))):  # backwards: A_t needs A_{t+1}
+            if ends[t]:
+                next_value = 0.0
+                last_gae = 0.0
+            else:
+                next_value = next_values[t + 1]
+            delta = rewards[t] + self.gamma * next_value - values[t]
+            last_gae = delta + self.gamma * self.gae_lambda * last_gae
+            advantages[t] = _finite_or_zero(last_gae)
+        return advantages
+
     def get_batches(
         self,
         batch_size: int,
@@ -286,3 +269,8 @@ class RolloutBuffer:
             ).long().to(self.device)
         else:
             self._cache['hidden_values'] = None
+
+
+def _finite_or_zero(x: float) -> float:
+    """x, or 0.0 if x is NaN or Inf."""
+    return x if not np.isnan(x) and not np.isinf(x) else 0.0

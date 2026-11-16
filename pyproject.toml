@@ -28,5 +28,5 @@ check_untyped_defs = false
 # Don't report errors in imported legacy modules — this is a partially-typed
 # research codebase. CI runs mypy only on the new, cleanly-typed library modules
 # (interfaces, reward_config, episode, runner); follow_imports=silent keeps the
-# numpy/torch typing noise in trainer.py/eval_suite.py from leaking in.
+# numpy/torch typing noise in trainer.py from leaking in.
 follow_imports = "silent"

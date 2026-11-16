@@ -1,7 +1,6 @@
 """Da Vinci Code Gymnasium Environment."""
 
 import logging
-import os
 from typing import Any, Optional
 
 import gymnasium as gym
@@ -42,7 +41,8 @@ class DaVinciCodeEnv(gym.Env):
         - my_hand: Player's hand (13, 2) with [color, value]
         - opponent_hand: Opponent's hand (13, 2) with hidden values
         - remaining_deck: [black_count, white_count]
-        - constraint_matrix: (13, 13) binary matrix of failed guesses
+        - opp_hand_constraint: (13, 13) ruled-out values per opponent slot (my failed guesses + revealed)
+        - my_hand_constraint: (13, 13) ruled-out values per my slot (opponent's failed guesses + revealed)
     
     Action Space:
         MultiDiscrete([2, 13, 13, 2]):
@@ -77,9 +77,6 @@ class DaVinciCodeEnv(gym.Env):
         self._seed = seed
         # Reward magnitudes (None → defaults identical to the old global constants).
         self._rc = reward_config if reward_config is not None else RewardConfig()
-        # Monotone reward mode (set via env var so it propagates to forked workers):
-        # when on, the terminal win bonus is dropped so reward is purely per-guess.
-        self._monotone_reward = os.environ.get("DVC_MONOTONE_REWARD") == "1"
         # viewer: if set to 0 or 1, render() will always show that player's perspective
         # This does NOT change the observation returned by _get_observation (keeps agent behavior).
         self.viewer: Optional[int] = viewer
@@ -98,7 +95,10 @@ class DaVinciCodeEnv(gym.Env):
             "remaining_deck": spaces.Box(
                 low=0, high=13, shape=(2,), dtype=np.int8
             ),
-            "constraint_matrix": spaces.Box(
+            "opp_hand_constraint": spaces.Box(
+                low=0, high=1, shape=(MAX_HAND_SIZE, NUM_VALUES), dtype=np.int8
+            ),
+            "my_hand_constraint": spaces.Box(
                 low=0, high=1, shape=(MAX_HAND_SIZE, NUM_VALUES), dtype=np.int8
             )
         })
@@ -405,9 +405,7 @@ class DaVinciCodeEnv(gym.Env):
         if self.players[opponent]._hand.all_revealed():
             self._done = True
             self._winner = self._current_player
-            # Monotone reward: no terminal win bonus, only the per-guess reward above.
-            if not self._monotone_reward:
-                reward += self._rc.win
+            reward += self._rc.win
             return reward
         
         return reward

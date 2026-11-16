@@ -429,10 +429,6 @@ class GameViewer:
         self.total_reward += reward
         self.update()
     
-    def clear_actions(self):
-        """새 스텝 시작 전 액션 초기화."""
-        # 현재 플레이어가 아닌 쪽 액션만 클리어 (또는 전부)
-        pass  # 필요시 구현
 
 
 def play_episode(policy: DaVinciCodePolicy, env: DaVinciCodeEnv,

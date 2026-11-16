@@ -57,13 +57,15 @@ class Player:
         """Get observation from this player's own perspective (full hand + constraint matrix)."""
         return {
             "my_hand": self._hand.to_observation(hidden=False),
-            "constraint_matrix": self._constraint_matrix.copy()
+            "opp_hand_constraint": self._constraint_matrix.copy()
         }
 
     def get_opponent_observation(self) -> dict[str, np.ndarray]:
         """Get observation of this player as seen by the opponent (hidden hand)."""
         return {
-            "opponent_hand": self._hand.to_observation(hidden=True)
+            "opponent_hand": self._hand.to_observation(hidden=True),
+            # This player's failed guesses on the viewer's slots (row i = viewer's slot i)
+            "my_hand_constraint": self._constraint_matrix.copy()
         }
     
     

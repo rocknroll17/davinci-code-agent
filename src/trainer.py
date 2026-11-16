@@ -10,7 +10,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -18,71 +18,63 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 
+from src import ppo_loss
 from src.buffer import RolloutBuffer, Transition
-from src.constants import MASK_VALUE, Phase
 from src.episode import Episode
-from src.model import DaVinciCodePolicy
-from src.result.result import Result
+from src.model import DaVinciCodePolicy, load_weights
 from src.reward_config import RewardConfig
 from src.vec_env import SubprocVecEnv, VectorDaVinciEnv
-from src.visualizer import DaVinciVisualizer, get_visualizer
 
 logger = logging.getLogger(__name__)
 
 @dataclass
 class PPOConfig:
     """PPO training configuration."""
-    # Training
-    total_timesteps: int = 1000000000
-    learning_rate: float =8e-5  # CNN 시절 1.25e-4에서 소폭 낮춤 (Transformer 안정성)
-    n_envs: int =300  # 수집 병목 해소: epu=20 채우는 시간 최소화
-    n_workers: int = 6  # rollout subproc 워커 수 = CPU 코어 수 (과구독 방지)
-    episodes_per_update: int = 300 # n_envs와 동일 → ~1라운드로 수집 완료
-    batch_size: int = 4096  # 1096→4096: minibatch 오버헤드↓, GPU/VRAM 활용↑ (CPU 병목 머신)
-    n_epochs: int = 8  # 에포크 늘려 데이터 재사용 극대화
-    
-    # PPO specific
+    # Rollouts
+    total_timesteps: int = 1_000_000_000
+    n_envs: int = 300                 # games played in parallel
+    n_workers: int = 6                # env worker processes (≈ CPU cores)
+    episodes_per_update: int = 300    # finished games collected per PPO update
+
+    # Optimization
+    learning_rate: float = 8e-5       # linearly decayed to lr_end
+    lr_end: float = 3e-5
+    batch_size: int = 4096            # minibatch size
+    n_epochs: int = 4                 # passes over each rollout
+    max_grad_norm: float = 0.5
+
+    # PPO
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_range: float = 0.2   # 0.15→0.2: policy 업데이트 폭 확대, plateau 탈출
-    clip_range_vf: float = 10.0  # 리턴 스케일 [-30,+30]에 맞춤 — 0.2는 절대값 clip이라 value 업데이트 과도 제한
-    ent_coef: float = 0.01  # 0.03→0.01: plateau 단계에서 entropy 너무 높으면 수렴 방해
-    color_ent_coef: float = 0.02  # ent_coef 2x 비율 유지
-    vf_coef: float = 0.5  # Value function coefficient
-    belief_coef: float = 0.2   # 0.5→0.2: 인코더가 RL/belief 양방향 gradient 동시 수신 → value feature 훼손 방지
-    max_grad_norm: float = 0.5
-    lr_end: float = 3e-5  # 1e-5→3e-5: plateau 단계에서 LR floor 상향
-    
+    clip_range: float = 0.2
+    clip_range_vf: float = 10.0       # absolute clip; returns span about ±30
+    ent_coef: float = 0.01
+    color_ent_coef: float = 0.02      # draw-color head explores more
+    vf_coef: float = 0.5
+    belief_coef: float = 0.2          # auxiliary belief cross-entropy
+
     # Model
     hidden_dim: int = 512
-    n_heads: int = 4   # encoder transformer attention heads (token_dim=128 must be divisible)
-    n_layers: int = 4  # encoder transformer layer count
-    zero_init: bool = False  # if True, init all default weights/biases to 0 (designated inits kept)
+    n_heads: int = 4                  # encoder attention heads (must divide token_dim=128)
+    n_layers: int = 4                 # encoder transformer layers
+    ff_dim: int = 512                 # width inside each encoder layer's feed-forward
 
     # Performance
-    fp16: bool = False    # mixed-precision (autocast fp16 + GradScaler). Turing→fp16, not bf16.
-    compile: bool = False  # torch.compile the encoder (skips .any()-branchy get_action)
+    fp16: bool = True                 # autocast fp16 + GradScaler (CUDA only)
+    compile: bool = False             # torch.compile the encoder
 
-    # Reward policy
-    # When True: monotone reward — no win/lose game-outcome signal. Only per-guess
-    # rewards (correct → +, wrong → −). Disables REWARD_WIN (env), REWARD_LOSE and
-    # REWARD_DRAW_WIN/LOSE (trainer retroactive).
-    monotone_reward: bool = False
-    # Reward magnitudes (injected into env + Episode). Default == historical constants.
+    # Reward
     reward_config: RewardConfig = field(default_factory=RewardConfig)
 
-    # Logging
+    # Logging / checkpoints
     log_interval: int = 1
     save_interval: int = 1
     eval_interval: int = 50
     n_eval_episodes: int = 50
-    
-    # Paths
     save_dir: str = "checkpoints"
     log_dir: str = "logs"
-    
-    reset_optimizer_on_load: bool = False  # Reset optimizer state when loading checkpoint
-    
+    reset_optimizer_on_load: bool = False
+
     def to_dict(self) -> dict:
         """Convert config to dictionary (nested RewardConfig → plain dict)."""
         d = {k: v for k, v in self.__dict__.items()}
@@ -133,7 +125,7 @@ class PPOTrainer:
             config.hidden_dim,
             n_heads=config.n_heads,
             n_layers=config.n_layers,
-            zero_init=config.zero_init,
+            ff_dim=config.ff_dim,
         ).to(self.device)
 
         # Mixed precision (fp16 + GradScaler). fp16 is CUDA-only (Turing → fp16),
@@ -157,16 +149,7 @@ class PPOTrainer:
             lr=config.learning_rate
         )
         
-        # LR Scheduler: linear decay from learning_rate to lr_end
-        # 에피소드당 평균 ~60 스텝 추정
-        avg_steps_per_episode = 45  # 실측 평균 ~45 steps/ep (이전 60은 과다 추정)
-        total_updates = config.total_timesteps // (config.episodes_per_update * avg_steps_per_episode)
-        self.scheduler = optim.lr_scheduler.LinearLR(
-            self.optimizer,
-            start_factor=1.0,
-            end_factor=config.lr_end / config.learning_rate,
-            total_iters=total_updates
-        )
+        self.scheduler = self._make_scheduler(self._total_updates())
         
         # Vectorized Environment (multiple games in parallel).
         # Per-rank seed offset so DDP ranks collect different games (not duplicates).
@@ -179,9 +162,9 @@ class PPOTrainer:
         else:
             self.vec_env = VectorDaVinciEnv(n_envs=config.n_envs, seed=env_seed,
                                             reward_config=config.reward_config)
-        self.env = self.vec_env.get_viz_env()  # For visualization compatibility
+        self.env = self.vec_env.get_viz_env()  # one local env, used by evaluate()
         
-        # Rollout buffer (에피소드 기반 수집이라 size 제한 없음)
+        # Rollout buffer (grows per rollout; cleared each collect)
         self.buffer = RolloutBuffer(
             gamma=config.gamma,
             gae_lambda=config.gae_lambda,
@@ -196,7 +179,6 @@ class PPOTrainer:
         # in train() and on load() so checkpoints/logs report accurate totals even
         # when per-rank timestep counts diverge (variable episode lengths).
         self._last_global_timesteps = 0
-        self.best_win_rate = 0.0
         # best_model is saved on highest rollout mean_reward; -inf so the first
         # update always sets a baseline. Persisted in the checkpoint (see save/load).
         self.best_mean_reward = float("-inf")
@@ -208,8 +190,10 @@ class PPOTrainer:
             "policy_loss": [],
             "value_loss": [],
             "belief_loss": [],
-            "entropy": [],  # Changed from entropy_loss
-            "total_loss": []
+            "entropy": [],
+            "total_loss": [],
+            "approx_kl": [],
+            "clipfrac": [],
         }
 
         # Training hooks (see src/hooks.py)
@@ -262,7 +246,7 @@ class PPOTrainer:
         Single loop for both backends. Backend differences are only at episode
         close: SubprocVecEnv auto-resets inside workers and reports the winner +
         reset obs via the info dict; VectorDaVinciEnv (threaded) reads the winner
-        from the env and resets it directly, and drives the live visualizer.
+        from the env and resets it directly.
 
         Returns:
             Dictionary of rollout statistics
@@ -320,15 +304,13 @@ class PPOTrainer:
                     )
                     episodes_collected += 1
 
-            # Live visualizer is only driven by the threaded backend.
-            if not self._use_subproc:
-                viz = get_visualizer()
-                if viz is not None:
-                    self._update_viz_from_vec(viz, rewards[0], episode_rewards[0], actions[0], results[0])
-
             obs = next_obs
 
-        return self._finalize_rollouts(obs, completed_rewards, completed_lengths, steps_collected)
+        # Drop games still in progress: no outcome rewards yet, and the next rollout resets them.
+        unfinished = {id(m.transition) for ep in per_env_tracking for m in ep.moves}
+        self.buffer.transitions = [t for t in self.buffer.transitions if id(t) not in unfinished]
+
+        return self._finalize_rollouts(completed_rewards, completed_lengths, steps_collected)
 
     # -------------------------------------------------------------------------
     # Rollout helpers
@@ -403,10 +385,11 @@ class PPOTrainer:
         *reset_obs* is applied to next_obs[i] when provided (threaded passes the
         result of reset_single(); subproc passes the obs from info['_reset_obs']).
         """
-        # End-of-game (retroactive) rewards are computed in one place by the
-        # Episode object. Monotone reward mode skips all win/lose shaping.
-        if not self.config.monotone_reward:
-            per_env_tracking[i].finalize(winner)
+        per_env_tracking[i].mark_terminal()
+        if self.config.reward_config.potential:
+            per_env_tracking[i].apply_potential(self.config.reward_config.potential, self.config.gamma)
+        # End-of-game (retroactive) rewards are computed in one place by the Episode object.
+        per_env_tracking[i].finalize(winner)
         # Reset this env's collector for the next game.
         per_env_tracking[i] = Episode(i, self.config.reward_config)
 
@@ -421,23 +404,13 @@ class PPOTrainer:
 
     def _finalize_rollouts(
         self,
-        obs: Dict[str, np.ndarray],
         completed_rewards: List[float],
         completed_lengths: List[int],
         steps_collected: int
     ) -> Dict[str, float]:
         """Compute GAE, normalize advantages, log stats. Shared by both collect methods."""
-        obs_tensor = self._batch_obs_to_tensor(obs)
-        with torch.no_grad():
-            _, _, last_values = self.policy.get_action(obs_tensor)
-        
-        last_values_np = last_values.cpu().numpy().flatten()
-        last_values_per_env = {i: float(last_values_np[i]) for i in range(self.n_envs)}
-        
-        returns, advantages = self.buffer.compute_returns_and_advantages(
-            last_value=0.0,
-            last_values_per_env=last_values_per_env
-        )
+        # Only finished games are in the buffer, so no bootstrap value is needed.
+        returns, advantages = self.buffer.compute_returns_and_advantages(last_value=0.0)
         
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
@@ -455,270 +428,88 @@ class PPOTrainer:
             "n_episodes": len(completed_rewards)
         }
     
-    def _update_viz_from_vec(
-        self,
-        viz: DaVinciVisualizer,
-        reward: float,
-        episode_reward: float,
-        action: np.ndarray,
-        result: Result
-    ) -> None:
-        """Update visualization from vectorized env."""
-        env = self.vec_env.get_viz_env()
-        render_obs, render_info = env.render_info()
-        phase_idx = int(np.argmax(render_obs["phase"]))
-        phase_name = Phase(phase_idx).name
-        viz.update_game_state(
-            my_hand=render_obs["my_hand"],
-            opponent_hand=render_obs["opponent_hand"],
-            phase=phase_name,
-            current_player=env._current_player,
-            streak=env._streak,
-            deck_black=env._deck.black_count,
-            deck_white=env._deck.white_count,
-            episode=self.episodes,
-            timesteps=self.timesteps,
-            reward=reward,
-            total_reward=episode_reward,
-            action=action,
-            result=result
-        )
-    
     def update(self) -> Dict[str, float]:
-        """
-        Perform PPO update on collected rollouts.
-        
-        Returns:
-            Dictionary of loss values
-        """
-        policy_losses = []
-        value_losses = []
-        belief_losses = []
-        entropy_losses = []
-        
-        # DDP: every rank must run the SAME number of minibatches per epoch,
-        # otherwise the per-batch grad all_reduce counts diverge (ranks collect
-        # different #steps → different ceil(n/batch_size)) → NCCL deadlock.
-        # Agree on the per-epoch minibatch count (min across ranks).
-        n_minibatches = (self.buffer.size + self.config.batch_size - 1) // self.config.batch_size
-        if self.world_size > 1:
-            t = torch.tensor([n_minibatches], device=self.device)
-            dist.all_reduce(t, op=dist.ReduceOp.MIN)
-            n_minibatches = max(1, int(t.item()))
+        """Run n_epochs of minibatch PPO on the collected rollout. Returns mean loss stats."""
+        stats = {k: [] for k in ["policy_loss", "value_loss", "belief_loss", "entropy", "approx_kl", "clipfrac"]}
+        entropy_weight = {"color": self.config.color_ent_coef / self.config.ent_coef}
+        n_minibatches = self._n_minibatches()
 
         for epoch in range(self.config.n_epochs):
-            for bi, batch in enumerate(self.buffer.get_batches(
-                self.config.batch_size,
-                self._returns,
-                self._advantages
-            )):
-                if bi >= n_minibatches:
-                    break  # keep all ranks at the same #minibatches (DDP collective match)
-                # Evaluate current policy on batch (heavy forward in fp16 under autocast).
-                with torch.autocast("cuda", dtype=torch.float16, enabled=self._fp16):
-                    log_probs, values, entropies, belief_logits = self.policy.evaluate_actions(
-                        batch["obs"],
-                        batch["actions"],
-                        batch["action_mask"]
-                    )
-                # Upcast outputs to fp32 so the (cheap) loss math is numerically stable.
-                if self._fp16:
-                    values = values.float()
-                    belief_logits = belief_logits.float()
-                    log_probs = {k: v.float() for k, v in log_probs.items()}
-                    entropies = {k: v.float() for k, v in entropies.items()}
+            batches = self.buffer.get_batches(self.config.batch_size, self._returns, self._advantages)
+            for i, batch in enumerate(batches):
+                if i >= n_minibatches:
+                    break
+                loss, batch_stats = self._loss(batch, entropy_weight)
+                self._optimize(loss)
+                for k, v in batch_stats.items():
+                    stats[k].append(v)
 
-                # Compute policy loss for each action head
-                policy_loss = torch.tensor(0.0, device=self.device)
-                entropy_sum = torch.tensor(0.0, device=self.device)
-                num_active_heads = 0
-                
-                phase = batch["obs"]["phase"]
-                
-                for key in ["color", "position", "value", "decision"]:
-                    # Get phase mask for this head
-                    if key == "color":
-                        head_mask = phase[:, 0].bool()
-                    elif key in ["position", "value"]:
-                        head_mask = phase[:, 1].bool()
-                    else:
-                        head_mask = phase[:, 2].bool()
-                    
-                    if not head_mask.any():
-                        continue
-                    
-                    num_active_heads += 1
-                    
-                    # Compute ratio
-                    old_log_prob = batch["old_log_probs"][key][head_mask]
-                    new_log_prob = log_probs[key][head_mask]
-                    
-                    # Clamp log prob difference for numerical stability
-                    log_ratio = new_log_prob - old_log_prob
-                    log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
-                    ratio = torch.exp(log_ratio)
-                    
-                    # Clipped surrogate loss
-                    adv = batch["advantages"][head_mask]
-                    
-                    surr1 = ratio * adv
-                    surr2 = torch.clamp(
-                        ratio, 
-                        1 - self.config.clip_range, 
-                        1 + self.config.clip_range
-                    ) * adv
-                    
-                    policy_loss = policy_loss - torch.min(surr1, surr2).mean()
-                    # Entropy bonus (positive entropy = good exploration)
-                    # Color head gets separate (higher) entropy weight for draw diversity
-                    if key == "color":
-                        entropy_sum = entropy_sum + (self.config.color_ent_coef / self.config.ent_coef) * entropies[key][head_mask].mean()
-                    else:
-                        entropy_sum = entropy_sum + entropies[key][head_mask].mean()
-                
-                # Average entropy over active heads
-                if num_active_heads > 0:
-                    entropy_mean = entropy_sum / num_active_heads
-                else:
-                    entropy_mean = torch.tensor(0.0, device=self.device)
-                
-                # Value loss
-                values = values.squeeze(-1)
-                if self.config.clip_range_vf is not None:
-                    # Clipped value loss - get old values from batch
-                    old_values = batch["old_values"] if "old_values" in batch else values.detach()
-                    values_clipped = old_values + torch.clamp(
-                        values - old_values,
-                        -self.config.clip_range_vf,
-                        self.config.clip_range_vf
-                    )
-                    vf_loss1 = (values - batch["returns"]) ** 2
-                    vf_loss2 = (values_clipped - batch["returns"]) ** 2
-                    value_loss = 0.5 * torch.max(vf_loss1, vf_loss2).mean()
-                else:
-                    value_loss = 0.5 * ((values - batch["returns"]) ** 2).mean()
-                
-                # Total loss: policy_loss - entropy_bonus + value_loss + belief_loss
-                # We want to MAXIMIZE entropy, so we SUBTRACT it from loss (below).
-
-                # Auxiliary belief loss: predict opponent's hidden card values
-                # Impossible-value masking: values that are structurally impossible for a given
-                # opponent slot (same-color cards already in my hand, or already revealed by opp)
-                # are masked to -inf before CE so the model is penalised for assigning them prob.
-                belief_loss = torch.tensor(0.0, device=self.device)
-                if batch["hidden_values"] is not None:
-                    hidden_vals = batch["hidden_values"]  # (B, 13) with -1 for non-hidden
-                    # Only compute loss for positions that are actually hidden (value >= 0)
-                    hidden_mask = hidden_vals >= 0  # (B, 13)
-                    if hidden_mask.any():
-                        B = hidden_vals.shape[0]
-                        # Build impossible-value mask from observation
-                        obs_my  = batch["obs"]["my_hand"].long()         # (B, 13, 2)
-                        obs_opp = batch["obs"]["opponent_hand"].long()   # (B, 13, 2)
-                        my_c = obs_my[:, :, 0]   # (B, 13) color
-                        my_v = obs_my[:, :, 1]   # (B, 13) value; -2=empty slot
-                        my_valid = (my_v >= 0) & (my_v < 13)
-                        opp_c = obs_opp[:, :, 0]  # (B, 13) color always visible
-                        opp_v = obs_opp[:, :, 1]  # (B, 13) -1=hidden
-                        opp_rev_valid = (opp_v >= 0) & (opp_v < 13)
-                        # color-value bitmaps: [b, color(0/1), value(0-12)]
-                        my_bmp  = torch.zeros(B, 2, 13, dtype=torch.bool, device=self.device)
-                        opp_bmp = torch.zeros(B, 2, 13, dtype=torch.bool, device=self.device)
-                        b_range = torch.arange(B, device=self.device)
-                        for slot in range(13):
-                            vld = my_valid[:, slot]
-                            vb = b_range[vld]
-                            if vb.numel() > 0:
-                                my_bmp[vb,
-                                       my_c[:, slot][vld].clamp(0, 1),
-                                       my_v[:, slot][vld].clamp(0, 12)] = True
-                            vld = opp_rev_valid[:, slot]
-                            vb = b_range[vld]
-                            if vb.numel() > 0:
-                                opp_bmp[vb,
-                                        opp_c[:, slot][vld].clamp(0, 1),
-                                        opp_v[:, slot][vld].clamp(0, 12)] = True
-                        # For each opp slot pos: impossible[b,pos,v] = bitmap[b, opp_c[b,pos], v]
-                        # gather along dim=1 (color dim) of (B,2,13) → (B,13,13)
-                        color_idx = opp_c.clamp(0, 1).unsqueeze(2).expand(B, 13, 13)
-                        impossible = (
-                            my_bmp.gather(1, color_idx) |
-                            opp_bmp.gather(1, color_idx)
-                        )  # (B, 13, 13)
-                        # Flatten to active hidden positions
-                        flat_logits  = belief_logits[hidden_mask]  # (N, 13)
-                        flat_targets = hidden_vals[hidden_mask]     # (N,)
-                        flat_imp     = impossible[hidden_mask]      # (N, 13)
-                        # Safety: never mask the true label itself
-                        flat_imp.scatter_(1, flat_targets.clamp(0, 12).unsqueeze(1), False)
-                        # Apply: impossible values → very negative before softmax.
-                        # MASK_VALUE (finite -1e4) instead of -inf so this stays NaN-safe
-                        # under fp16 autocast (softmax(-1e4) ~ 0, same effect as -inf).
-                        flat_logits = flat_logits.masked_fill(flat_imp, MASK_VALUE)
-                        belief_loss = nn.functional.cross_entropy(flat_logits, flat_targets)
-                
-                loss = (
-                    policy_loss
-                    + self.config.vf_coef * value_loss
-                    + self.config.belief_coef * belief_loss
-                    - self.config.ent_coef * entropy_mean  # Subtract to maximize entropy
-                )
-                
-                # NaN/Inf: do NOT `continue` (that would skip this rank's grad
-                # all_reduce → DDP deadlock). Proceed — GradScaler.step auto-skips
-                # the optimizer step when grads are inf/nan, and all_reduce stays matched.
-                if self.is_main and (torch.isnan(loss) or torch.isinf(loss)):
-                    logger.warning("Loss is NaN/Inf this batch — GradScaler will skip the step")
-
-                # Backprop (GradScaler is a no-op when fp16 is disabled).
-                self.optimizer.zero_grad()
-                self.scaler.scale(loss).backward()
-                # DDP: average gradients across ranks (manual — evaluate_actions is
-                # a custom method, so the DDP wrapper's forward hooks don't apply).
-                # Zero-fill missing grads so EVERY rank all-reduces the SAME param
-                # set in the SAME order: phase-gated heads may get no grad in a given
-                # minibatch on one rank but not another → otherwise NCCL shape/seq
-                # mismatch → deadlock. None grad ⇒ this rank contributes zeros.
-                if self.world_size > 1:
-                    for p in self.policy.parameters():
-                        if not p.requires_grad:
-                            continue
-                        if p.grad is None:
-                            p.grad = torch.zeros_like(p)
-                        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-                        p.grad.div_(self.world_size)
-                self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(
-                    self.policy.parameters(),
-                    self.config.max_grad_norm
-                )
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                
-                policy_losses.append(policy_loss.item())
-                value_losses.append(value_loss.item())
-                belief_losses.append(belief_loss.item())
-                entropy_losses.append(entropy_mean.item())  # Store actual entropy
-        
         self.updates += 1
-        
-        # Track losses
-        mean_losses = {
-            "policy_loss": np.mean(policy_losses) if policy_losses else 0.0,
-            "value_loss": np.mean(value_losses) if value_losses else 0.0,
-            "belief_loss": np.mean(belief_losses) if belief_losses else 0.0,
-            "entropy": np.mean(entropy_losses) if entropy_losses else 0.0,
-            "total_loss": (np.mean(policy_losses) if policy_losses else 0.0) + 
-                         self.config.vf_coef * (np.mean(value_losses) if value_losses else 0.0) +
-                         self.config.belief_coef * (np.mean(belief_losses) if belief_losses else 0.0) -
-                         self.config.ent_coef * (np.mean(entropy_losses) if entropy_losses else 0.0)
-        }
-        
-        for key, value in mean_losses.items():
+        mean = {k: float(np.mean(v)) if v else 0.0 for k, v in stats.items()}
+        mean["total_loss"] = (mean["policy_loss"] + self.config.vf_coef * mean["value_loss"]
+                              + self.config.belief_coef * mean["belief_loss"] - self.config.ent_coef * mean["entropy"])
+        for key, value in mean.items():
             self.losses[key].append(value)
-        
-        return mean_losses
-    
+        return mean
+
+    def _loss(self, batch: Dict[str, Any], entropy_weight: Dict[str, float]) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Total PPO loss for one minibatch (B rows), plus its parts for logging."""
+        # The network forward runs in fp16 (if enabled); the loss math below runs in fp32.
+        with torch.autocast("cuda", dtype=torch.float16, enabled=self._fp16):
+            log_probs, values, entropies, belief_logits = self.policy.evaluate_actions(
+                batch["obs"], batch["actions"], batch["action_mask"])
+        values = values.float().squeeze(-1)          # (B,)
+        belief_logits = belief_logits.float()        # (B, 13, 13)
+        log_probs = {k: v.float() for k, v in log_probs.items()}   # {head: (B,)}
+        entropies = {k: v.float() for k, v in entropies.items()}   # {head: (B,)}
+
+        pi_loss, entropy, kls, clipfracs = ppo_loss.policy_loss(
+            log_probs, batch["old_log_probs"], entropies, batch["advantages"],
+            batch["obs"]["phase"], self.config.clip_range, entropy_weight)
+        v_loss = ppo_loss.value_loss(values, batch["old_values"], batch["returns"], self.config.clip_range_vf)
+        b_loss = torch.tensor(0.0, device=self.device)
+        if batch["hidden_values"] is not None:
+            b_loss = ppo_loss.belief_loss(belief_logits, batch["hidden_values"],
+                                          batch["obs"]["my_hand"], batch["obs"]["opponent_hand"])
+
+        total = (pi_loss + self.config.vf_coef * v_loss + self.config.belief_coef * b_loss
+                 - self.config.ent_coef * entropy)
+        if self.is_main and not torch.isfinite(total):
+            logger.warning("Loss is NaN/Inf this batch — GradScaler will skip the step")
+        return total, {"policy_loss": pi_loss.item(), "value_loss": v_loss.item(), "belief_loss": b_loss.item(),
+                       "entropy": entropy.item(), "approx_kl": float(np.mean(kls)) if kls else 0.0,
+                       "clipfrac": float(np.mean(clipfracs)) if clipfracs else 0.0}
+
+    def _optimize(self, loss: torch.Tensor) -> None:
+        """One optimizer step (fp16 GradScaler, manual DDP gradient averaging, grad clipping)."""
+        self.optimizer.zero_grad()
+        self.scaler.scale(loss).backward()
+        if self.world_size > 1:
+            # evaluate_actions bypasses the DDP wrapper, so average gradients by hand.
+            # Every rank must all-reduce the same params in the same order: a head that
+            # got no gradient on this rank contributes zeros instead of being skipped.
+            for p in self.policy.parameters():
+                if not p.requires_grad:
+                    continue
+                if p.grad is None:
+                    p.grad = torch.zeros_like(p)
+                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                p.grad.div_(self.world_size)
+        self.scaler.unscale_(self.optimizer)
+        nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+        self.scaler.step(self.optimizer)  # skipped automatically if gradients are inf/nan
+        self.scaler.update()
+
+    def _n_minibatches(self) -> int:
+        """Minibatches per epoch. DDP ranks hold different amounts of data, so they agree
+        on the minimum — otherwise their gradient all-reduces would not line up (deadlock)."""
+        n = (self.buffer.size + self.config.batch_size - 1) // self.config.batch_size
+        if self.world_size > 1:
+            t = torch.tensor([n], device=self.device)
+            dist.all_reduce(t, op=dist.ReduceOp.MIN)
+            n = max(1, int(t.item()))
+        return n
+
     def evaluate(self, n_episodes: int = 20) -> Dict[str, float]:
         """
         Evaluate current policy.
@@ -810,35 +601,9 @@ class PPOTrainer:
         # loader rejects. Matches ModelAgent.from_checkpoint.
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
-        # Normalize torch.compile's "_orig_mod." wrapper on BOTH sides so a
-        # checkpoint loads regardless of whether either it or the current model
-        # was compiled. We match on normalized names, then write into the real
-        # (possibly-prefixed) model keys.
-        def _norm(k: str) -> str:
-            return k.replace("._orig_mod.", ".")
-
-        saved_state = {_norm(k): v for k, v in checkpoint["policy_state_dict"].items()}
-        model_state = self.policy.state_dict()
-        norm_to_real = {_norm(k): k for k in model_state}
-
-        # Filter out keys whose shape changed (e.g., belief_head after architecture update)
-        # strict=False only handles missing/unexpected keys, not shape mismatches
-        compatible = {}
-        shape_mismatch = []
-        for nk, v in saved_state.items():
-            rk = norm_to_real.get(nk)
-            if rk is None:
-                continue
-            if v.shape == model_state[rk].shape:
-                compatible[rk] = v
-            else:
-                shape_mismatch.append(rk)
-        if shape_mismatch:
-            print(f"Shape mismatch — re-initialized: {shape_mismatch}")
-
-        missing, unexpected = self.policy.load_state_dict(compatible, strict=False)
-        if missing:
-            print(f"New parameters initialized randomly: {missing}")
+        fresh = load_weights(self.policy, checkpoint["policy_state_dict"])
+        if fresh:
+            print(f"Parameters kept (some) fresh init: {fresh}")
         
         if self.config.reset_optimizer_on_load:
             # Reset optimizer with fresh state (useful after finetune→normal transition)
@@ -866,16 +631,17 @@ class PPOTrainer:
         # Always apply config LR (checkpoint may have old LR)
         for pg in self.optimizer.param_groups:
             pg['lr'] = self.config.learning_rate
-        # Re-create scheduler from current point
-        avg_steps_per_episode = 45  # 실측 평균 ~45 steps/ep
-        total_updates = self.config.total_timesteps // (self.config.episodes_per_update * avg_steps_per_episode)
-        remaining = max(total_updates - self.updates, 1)
-        self.scheduler = optim.lr_scheduler.LinearLR(
-            self.optimizer,
-            start_factor=1.0,
-            end_factor=self.config.lr_end / self.config.learning_rate,
-            total_iters=remaining
-        )
+        self.scheduler = self._make_scheduler(max(self._total_updates() - self.updates, 1))
+
+    def _total_updates(self) -> int:
+        """Planned number of updates (a game is about 45 steps)."""
+        return self.config.total_timesteps // (self.config.episodes_per_update * 45)
+
+    def _make_scheduler(self, n_updates: int) -> optim.lr_scheduler.LinearLR:
+        """Linear LR decay from learning_rate to lr_end over n_updates."""
+        return optim.lr_scheduler.LinearLR(
+            self.optimizer, start_factor=1.0,
+            end_factor=self.config.lr_end / self.config.learning_rate, total_iters=n_updates)
 
     def _global_timesteps(self) -> int:
         """True global timestep count, identical on every rank.
@@ -930,15 +696,9 @@ class PPOTrainer:
                       f"LR: {current_lr:.2e} | "
                       f"Policy Loss: {update_stats['policy_loss']:.4f} | "
                       f"Value Loss: {update_stats['value_loss']:.4f} | "
-                      f"Belief Loss: {update_stats['belief_loss']:.4f}")
-                viz = get_visualizer()
-                if viz is not None:
-                    viz.update_training_stats(
-                        mean_reward=rollout_stats['mean_reward'],
-                        policy_loss=update_stats['policy_loss'],
-                        value_loss=update_stats['value_loss']
-                    )
-                    viz.add_log(f"Update {update_count}: R={rollout_stats['mean_reward']:.2f}")
+                      f"Belief Loss: {update_stats['belief_loss']:.4f} | "
+                      f"KL: {update_stats['approx_kl']:.4f} | "
+                      f"ClipFrac: {update_stats['clipfrac']:.3f}")
 
             if self.is_main:
                 self._call_hooks_update({
@@ -952,6 +712,8 @@ class PPOTrainer:
                     "belief_loss":         update_stats["belief_loss"],
                     "entropy":             update_stats["entropy"],
                     "total_loss":          update_stats["total_loss"],
+                    "approx_kl":           update_stats["approx_kl"],
+                    "clipfrac":            update_stats["clipfrac"],
                     "learning_rate":       current_lr,
                 })
 
