@@ -102,7 +102,7 @@ class ObservationEncoder(nn.Module):
     """
 
     def __init__(self, hidden_dim: int = 512, token_dim: int = 128,
-                 n_heads: int = 4, n_layers: int = 4) -> None:
+                 n_heads: int = 4, n_layers: int = 4, ff_dim: int = 512) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self.token_dim = token_dim
@@ -122,7 +122,7 @@ class ObservationEncoder(nn.Module):
         self.deck_proj = nn.Sequential(nn.Linear(2, token_dim), nn.LayerNorm(token_dim))
 
         layer = nn.TransformerEncoderLayer(d_model=token_dim, nhead=n_heads,
-                                           dim_feedforward=token_dim * 4, dropout=0.0,
+                                           dim_feedforward=ff_dim, dropout=0.0,
                                            batch_first=True, norm_first=True)
         self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
 
@@ -307,12 +307,12 @@ class DaVinciCodePolicy(nn.Module):
     """
 
     def __init__(self, hidden_dim: int = 512, n_heads: int = 4, n_layers: int = 4,
-                 zero_init: bool = False) -> None:
+                 zero_init: bool = False, ff_dim: int = 512) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self._zero_init = zero_init
 
-        self.encoder = ObservationEncoder(hidden_dim, n_heads=n_heads, n_layers=n_layers)
+        self.encoder = ObservationEncoder(hidden_dim, n_heads=n_heads, n_layers=n_layers, ff_dim=ff_dim)
         self.action_heads = PhaseGatedActionHead(hidden_dim)
         self.value_head = ValueHead(hidden_dim)
         # Belief: for every opponent slot, a distribution over its 13 possible values.

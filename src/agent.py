@@ -93,7 +93,9 @@ class ModelAgent:
         hidden_dim = cfg.get("hidden_dim") or hidden_dim
         n_heads = cfg.get("n_heads") or n_heads
         n_layers = cfg.get("n_layers") or n_layers
-        policy = DaVinciCodePolicy(hidden_dim=hidden_dim, n_heads=n_heads, n_layers=n_layers).to(device)
+        ff_dim = cfg.get("ff_dim") or 512
+        policy = DaVinciCodePolicy(hidden_dim=hidden_dim, n_heads=n_heads, n_layers=n_layers,
+                                   ff_dim=ff_dim).to(device)
 
         load_weights(policy, checkpoint.get("policy_state_dict", checkpoint))
 

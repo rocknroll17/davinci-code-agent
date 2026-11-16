@@ -60,6 +60,7 @@ class PPOConfig:
     hidden_dim: int = 512
     n_heads: int = 4                  # encoder attention heads (must divide token_dim=128)
     n_layers: int = 4                 # encoder transformer layers
+    ff_dim: int = 512                 # width inside each encoder layer's feed-forward
     zero_init: bool = False           # all default weights start at 0
 
     # Performance
@@ -130,6 +131,7 @@ class PPOTrainer:
             n_heads=config.n_heads,
             n_layers=config.n_layers,
             zero_init=config.zero_init,
+            ff_dim=config.ff_dim,
         ).to(self.device)
 
         # Mixed precision (fp16 + GradScaler). fp16 is CUDA-only (Turing → fp16),

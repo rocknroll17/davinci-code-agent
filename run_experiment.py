@@ -31,6 +31,8 @@ def parse_args() -> argparse.Namespace:
                    help="outcome = win/lose only + potential-based shaping")
     p.add_argument("--n-heads", type=int, default=4, help="encoder attention heads")
     p.add_argument("--n-layers", type=int, default=4, help="encoder transformer layers")
+    p.add_argument("--hidden-dim", type=int, default=512, help="width after the encoder (fusion, head inputs)")
+    p.add_argument("--ff-dim", type=int, default=512, help="width inside each encoder layer's feed-forward")
     p.add_argument("--zero-init", action="store_true",
                    help="initialize all default weights/biases to 0 (designated inits kept)")
     p.add_argument("--device-id", type=int, default=0, help="CUDA device index")
@@ -39,6 +41,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-envs", type=int, default=440)
     p.add_argument("--n-workers", type=int, default=22)
     p.add_argument("--batch-size", type=int, default=8192)
+    p.add_argument("--ent-coef", type=float, default=0.01,
+                   help="entropy bonus; the draw-color head gets 2x (same ratio as the default)")
     p.add_argument("--torch-threads", type=int, default=4,
                    help="intra-op torch threads per process (avoid 4-way oversubscription)")
     p.add_argument("--gpu-mem-gb", type=float, default=0,
@@ -92,8 +96,12 @@ def main() -> None:
         n_workers=args.n_workers,
         episodes_per_update=args.n_envs,  # ~1 collection round per update
         batch_size=args.batch_size,
+        ent_coef=args.ent_coef,
+        color_ent_coef=2 * args.ent_coef,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
+        hidden_dim=args.hidden_dim,
+        ff_dim=args.ff_dim,
         zero_init=args.zero_init,
         monotone_reward=(args.reward_mode == "monotone"),
         reward_config=OUTCOME_REWARD if args.reward_mode == "outcome" else RewardConfig(),
