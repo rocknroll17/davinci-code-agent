@@ -44,7 +44,8 @@ class OnnxAgent:
     def _run(self, obs, i, position):
         obs = dict(obs, constraint_matrix=obs["opp_hand_constraint"])  # older graphs use this name
         feeds = {k: obs[k][i:i + 1].astype(np.float32) for k in self.inputs if k != "selected_position"}
-        feeds["selected_position"] = np.array([position], dtype=np.int64)
+        if "selected_position" in self.inputs:
+            feeds["selected_position"] = np.array([position], dtype=np.int64)
         color, pos, value, decision = self.session.run(
             ["color_logits", "position_logits", "value_logits", "decision_logits"], feeds)
         return color[0], pos[0], value[0], decision[0]
@@ -52,9 +53,12 @@ class OnnxAgent:
     def act_batch(self, obs, masks, deterministic=True):
         actions = np.zeros((len(obs["phase"]), 4), dtype=np.int64)
         for i in range(len(actions)):
-            color, pos, _, decision = self._run(obs, i, 0)
+            color, pos, value, decision = self._run(obs, i, 0)
             position = masked_argmax(pos, masks["position"][i])
-            _, _, value, _ = self._run(obs, i, position)
+            if "selected_position" in self.inputs:      # older graphs: 2nd run for the chosen position
+                _, _, value, _ = self._run(obs, i, position)
+            else:                                       # value logits for every position in one run
+                value = value[position]
             actions[i] = [
                 masked_argmax(color, masks["color"][i]),
                 position,

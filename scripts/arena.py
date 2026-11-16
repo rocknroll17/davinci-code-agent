@@ -17,7 +17,7 @@ mean_reward is identical across variants (same data), so it does NOT rank them â
 Edit CONFIGS below to define your variants. Each is a dict of PPOConfig-field overrides
 (+ `separate_my_slot_pe` or any model flag you add behind a config field).
 
-Env note (this box): export LD_LIBRARY_PATH=/home/temp/py310/lib
+Env note (this box): export LD_LIBRARY_PATH=/home/rocknroll1397/.pyenv/versions/3.10.12/lib
 Run:  PYTHONPATH=$PWD python scripts/arena.py --checkpoint checkpoints/best_model_control.pt --updates 100
 """
 import argparse
