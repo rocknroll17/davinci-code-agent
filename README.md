@@ -15,12 +15,11 @@ under the paper's rules:
 
 | Agent | Win rate | Games |
 |---|---|---|
-| **This agent** (2 layers, 0.48M parameters) | **60.0% ±1.0%** | 10,000 |
-| This agent before shrinking (4 layers, 1.60M parameters) | 59.0% ±1.0% | 10,000 |
+| **This agent** | **60.0% ±1.0%** | 10,000 |
 | PPO agent, as reported in the paper | 58.5% ±1.0% | 10,000 |
 | Human experts, as reported in the paper | 50.0% – 64.0% | 20 – 25 |
 
-The browser model is 0.68 MB (was 6.52 MB) and takes 0.65 ms per action (was 3.16 ms).
+The model has 0.48M parameters; the browser build is 0.68 MB and takes 0.65 ms per action.
 
 ## How it works
 
