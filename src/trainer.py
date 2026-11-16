@@ -20,13 +20,10 @@ import torch.optim as optim
 
 from src import ppo_loss
 from src.buffer import RolloutBuffer, Transition
-from src.constants import Phase
 from src.episode import Episode
 from src.model import DaVinciCodePolicy, load_weights
-from src.result.result import Result
 from src.reward_config import RewardConfig
 from src.vec_env import SubprocVecEnv, VectorDaVinciEnv
-from src.visualizer import DaVinciVisualizer, get_visualizer
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +165,7 @@ class PPOTrainer:
         else:
             self.vec_env = VectorDaVinciEnv(n_envs=config.n_envs, seed=env_seed,
                                             reward_config=config.reward_config)
-        self.env = self.vec_env.get_viz_env()  # For visualization compatibility
+        self.env = self.vec_env.get_viz_env()  # one local env, used by evaluate()
         
         # Rollout buffer (grows per rollout; cleared each collect)
         self.buffer = RolloutBuffer(
@@ -252,7 +249,7 @@ class PPOTrainer:
         Single loop for both backends. Backend differences are only at episode
         close: SubprocVecEnv auto-resets inside workers and reports the winner +
         reset obs via the info dict; VectorDaVinciEnv (threaded) reads the winner
-        from the env and resets it directly, and drives the live visualizer.
+        from the env and resets it directly.
 
         Returns:
             Dictionary of rollout statistics
@@ -309,12 +306,6 @@ class PPOTrainer:
                         winner, reset_obs,
                     )
                     episodes_collected += 1
-
-            # Live visualizer is only driven by the threaded backend.
-            if not self._use_subproc:
-                viz = get_visualizer()
-                if viz is not None:
-                    self._update_viz_from_vec(viz, rewards[0], episode_rewards[0], actions[0], results[0])
 
             obs = next_obs
 
@@ -441,35 +432,6 @@ class PPOTrainer:
             "mean_length": np.mean(completed_lengths) if completed_lengths else 0.0,
             "n_episodes": len(completed_rewards)
         }
-    
-    def _update_viz_from_vec(
-        self,
-        viz: DaVinciVisualizer,
-        reward: float,
-        episode_reward: float,
-        action: np.ndarray,
-        result: Result
-    ) -> None:
-        """Update visualization from vectorized env."""
-        env = self.vec_env.get_viz_env()
-        render_obs, render_info = env.render_info()
-        phase_idx = int(np.argmax(render_obs["phase"]))
-        phase_name = Phase(phase_idx).name
-        viz.update_game_state(
-            my_hand=render_obs["my_hand"],
-            opponent_hand=render_obs["opponent_hand"],
-            phase=phase_name,
-            current_player=env._current_player,
-            streak=env._streak,
-            deck_black=env._deck.black_count,
-            deck_white=env._deck.white_count,
-            episode=self.episodes,
-            timesteps=self.timesteps,
-            reward=reward,
-            total_reward=episode_reward,
-            action=action,
-            result=result
-        )
     
     def update(self) -> Dict[str, float]:
         """Run n_epochs of minibatch PPO on the collected rollout. Returns mean loss stats."""
@@ -742,14 +704,6 @@ class PPOTrainer:
                       f"Belief Loss: {update_stats['belief_loss']:.4f} | "
                       f"KL: {update_stats['approx_kl']:.4f} | "
                       f"ClipFrac: {update_stats['clipfrac']:.3f}")
-                viz = get_visualizer()
-                if viz is not None:
-                    viz.update_training_stats(
-                        mean_reward=rollout_stats['mean_reward'],
-                        policy_loss=update_stats['policy_loss'],
-                        value_loss=update_stats['value_loss']
-                    )
-                    viz.add_log(f"Update {update_count}: R={rollout_stats['mean_reward']:.2f}")
 
             if self.is_main:
                 self._call_hooks_update({
