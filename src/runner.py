@@ -1,9 +1,8 @@
 """
 run_episode — the single canonical "play one full game" loop.
 
-Before this, the reset→while-not-done→pick-action→step loop was copy-pasted in
-``PPOTrainer.evaluate``, ``EvalSuite.run_policy`` and ``compare_experiments.play_match``.
-They differed only in: single-agent self-play vs two-agent head-to-head, and how
+The reset→while-not-done→pick-action→step loop used to be copy-pasted in several
+evaluation paths. They differed only in: single-agent self-play vs two-agent head-to-head, and how
 much per-step statistics they collected. ``run_episode`` unifies the loop and
 exposes an ``on_step`` callback so callers inject their own stats without
 duplicating control flow.

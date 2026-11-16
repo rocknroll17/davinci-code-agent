@@ -2,8 +2,8 @@
 """
 Vectorized batch arena — play hundreds of games in parallel per pairing.
 
-The per-game arena (compare_experiments) plays ONE game at a time => batch-1
-GPU forwards, GPU ~idle, CPU/launch-latency bound. This runs N games at once on
+Playing ONE game at a time means batch-1 GPU forwards: GPU ~idle, CPU/launch-latency
+bound. This runs N games at once on
 a SubprocVecEnv and does ONE batched forward per model per step, so the GPU is
 actually used. Engine is untouched — only the eval loop is batched. ~10-50x.
 
