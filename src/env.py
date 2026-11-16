@@ -1,7 +1,6 @@
 """Da Vinci Code Gymnasium Environment."""
 
 import logging
-import os
 from typing import Any, Optional
 
 import gymnasium as gym
@@ -78,9 +77,6 @@ class DaVinciCodeEnv(gym.Env):
         self._seed = seed
         # Reward magnitudes (None → defaults identical to the old global constants).
         self._rc = reward_config if reward_config is not None else RewardConfig()
-        # Monotone reward mode (set via env var so it propagates to forked workers):
-        # when on, the terminal win bonus is dropped so reward is purely per-guess.
-        self._monotone_reward = os.environ.get("DVC_MONOTONE_REWARD") == "1"
         # viewer: if set to 0 or 1, render() will always show that player's perspective
         # This does NOT change the observation returned by _get_observation (keeps agent behavior).
         self.viewer: Optional[int] = viewer
@@ -409,9 +405,7 @@ class DaVinciCodeEnv(gym.Env):
         if self.players[opponent]._hand.all_revealed():
             self._done = True
             self._winner = self._current_player
-            # Monotone reward: no terminal win bonus, only the per-guess reward above.
-            if not self._monotone_reward:
-                reward += self._rc.win
+            reward += self._rc.win
             return reward
         
         return reward

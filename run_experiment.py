@@ -17,14 +17,12 @@ import os
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Da Vinci Code experiment runner")
     p.add_argument("--exp", required=True, help="experiment name (output dir)")
-    p.add_argument("--reward-mode", choices=["normal", "monotone", "outcome"], default="normal",
+    p.add_argument("--reward-mode", choices=["normal", "outcome"], default="normal",
                    help="outcome = win/lose only + potential-based shaping")
     p.add_argument("--n-heads", type=int, default=4, help="encoder attention heads")
     p.add_argument("--n-layers", type=int, default=4, help="encoder transformer layers")
     p.add_argument("--hidden-dim", type=int, default=512, help="width after the encoder (fusion, head inputs)")
     p.add_argument("--ff-dim", type=int, default=512, help="width inside each encoder layer's feed-forward")
-    p.add_argument("--zero-init", action="store_true",
-                   help="initialize all default weights/biases to 0 (designated inits kept)")
     p.add_argument("--device-id", type=int, default=0, help="CUDA device index")
     p.add_argument("--total-timesteps", type=int, default=10_000_000)
     # Throughput knobs (defaults tuned for ~24 CPU cores / GPU on this 96-core box)
@@ -51,8 +49,6 @@ def main() -> None:
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     if world_size == 1:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
-    if args.reward_mode == "monotone":
-        os.environ["DVC_MONOTONE_REWARD"] = "1"
     # Limit BLAS / OpenMP threads so 4 concurrent runs don't each grab all cores.
     os.environ.setdefault("OMP_NUM_THREADS", str(args.torch_threads))
     os.environ.setdefault("MKL_NUM_THREADS", str(args.torch_threads))
@@ -98,8 +94,6 @@ def main() -> None:
         n_layers=args.n_layers,
         hidden_dim=args.hidden_dim,
         ff_dim=args.ff_dim,
-        zero_init=args.zero_init,
-        monotone_reward=(args.reward_mode == "monotone"),
         reward_config=OUTCOME_REWARD if args.reward_mode == "outcome" else RewardConfig(),
         save_dir=save_dir,
         log_dir=log_dir,
@@ -128,9 +122,8 @@ def print_summary(args, config, exp_dir: str, world_size: int) -> None:
     print("=" * 70)
     print(f"Experiment: {args.exp}")
     print(f"  processes (GPUs) : {world_size}")
-    print(f"  reward_mode      : {args.reward_mode} (monotone={config.monotone_reward})")
+    print(f"  reward_mode      : {args.reward_mode}")
     print(f"  n_heads/n_layers : {config.n_heads} / {config.n_layers}")
-    print(f"  zero_init        : {config.zero_init}")
     print(f"  n_envs/n_workers : {config.n_envs} / {config.n_workers}")
     print(f"  batch_size       : {config.batch_size}")
     print(f"  total_timesteps  : {config.total_timesteps:,}")

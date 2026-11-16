@@ -307,10 +307,9 @@ class DaVinciCodePolicy(nn.Module):
     """
 
     def __init__(self, hidden_dim: int = 512, n_heads: int = 4, n_layers: int = 4,
-                 zero_init: bool = False, ff_dim: int = 512) -> None:
+                 ff_dim: int = 512) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
-        self._zero_init = zero_init
 
         self.encoder = ObservationEncoder(hidden_dim, n_heads=n_heads, n_layers=n_layers, ff_dim=ff_dim)
         self.action_heads = PhaseGatedActionHead(hidden_dim)
@@ -326,13 +325,7 @@ class DaVinciCodePolicy(nn.Module):
         nn.init.zeros_(self.belief_to_opp_proj.bias)
 
     def _init_weights(self, module: nn.Module) -> None:
-        """Orthogonal init for Linear/Conv, normal(0, 0.02) for Embedding (all zeros if zero_init)."""
-        if self._zero_init:
-            if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Embedding)):
-                nn.init.zeros_(module.weight)
-                if getattr(module, "bias", None) is not None:
-                    nn.init.zeros_(module.bias)
-            return
+        """Orthogonal init for Linear/Conv, normal(0, 0.02) for Embedding."""
         if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d)):
             nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
             if module.bias is not None:

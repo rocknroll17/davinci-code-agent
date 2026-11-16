@@ -58,14 +58,12 @@ class PPOConfig:
     n_heads: int = 4                  # encoder attention heads (must divide token_dim=128)
     n_layers: int = 4                 # encoder transformer layers
     ff_dim: int = 512                 # width inside each encoder layer's feed-forward
-    zero_init: bool = False           # all default weights start at 0
 
     # Performance
     fp16: bool = True                 # autocast fp16 + GradScaler (CUDA only)
     compile: bool = False             # torch.compile the encoder
 
     # Reward
-    monotone_reward: bool = False     # per-guess rewards only, no win/lose signal
     reward_config: RewardConfig = field(default_factory=RewardConfig)
 
     # Logging / checkpoints
@@ -127,7 +125,6 @@ class PPOTrainer:
             config.hidden_dim,
             n_heads=config.n_heads,
             n_layers=config.n_layers,
-            zero_init=config.zero_init,
             ff_dim=config.ff_dim,
         ).to(self.device)
 
@@ -391,10 +388,8 @@ class PPOTrainer:
         per_env_tracking[i].mark_terminal()
         if self.config.reward_config.potential:
             per_env_tracking[i].apply_potential(self.config.reward_config.potential, self.config.gamma)
-        # End-of-game (retroactive) rewards are computed in one place by the
-        # Episode object. Monotone reward mode skips all win/lose shaping.
-        if not self.config.monotone_reward:
-            per_env_tracking[i].finalize(winner)
+        # End-of-game (retroactive) rewards are computed in one place by the Episode object.
+        per_env_tracking[i].finalize(winner)
         # Reset this env's collector for the next game.
         per_env_tracking[i] = Episode(i, self.config.reward_config)
 
